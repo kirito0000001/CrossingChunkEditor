@@ -112,7 +112,7 @@ pakchunk0-Windows.utoc / .ucas ...
 |---|---|---|---|
 | Windows | `Win64` | `Client` | PC 客户端 |
 | 安卓 | `Android` | `Client` | 安卓客户端 |
-| 服务器 | `Win64` | `Server` | **出散件、走 git，不分包** |
+| 服务器 | `Win64` | `Server` | **出散件，不分包** |
 
 | 模式 | 值 | 说明 |
 |---|---|---|
