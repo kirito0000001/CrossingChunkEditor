@@ -1,0 +1,19 @@
+# Unreal Engine 编译产物
+Binaries/
+Intermediate/
+DerivedDataCache/
+Build/
+Saved/
+
+# IDE
+.vs/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# 系统
+.DS_Store
+Thumbs.db
