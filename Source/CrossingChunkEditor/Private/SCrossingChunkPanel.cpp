@@ -180,7 +180,7 @@ void SCrossingChunkPanel::Construct(const FArguments& InArgs)
 			[
 				SNew(STextBlock).Text(this, &SCrossingChunkPanel::GetSummaryText).AutoWrapText(true).ColorAndOpacity(FSlateColor::UseSubduedForeground())
 			]
-			// ---- 打包：和命令行是同一套命令（Tools\Pack-CrossingVoid.ps1）----
+			// ---- 打包：和命令行是同一套命令（插件自带的 Tools\Pack-CrossingVoid.ps1）----
 			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6.f, 0.f, 2.f, 0.f)
 			[
 				SNew(SComboBox<TSharedPtr<FChoice>>)
@@ -245,7 +245,7 @@ void SCrossingChunkPanel::Construct(const FArguments& InArgs)
 			[
 				SNew(SButton)
 				.Text(this, &SCrossingChunkPanel::GetPackButtonText)
-				.ToolTipText(LOCTEXT("PackTip", "跑 Tools\\Pack-CrossingVoid.ps1（日志在下面实时滚动，结束自动刷新报告）"))
+				.ToolTipText(LOCTEXT("PackTip", "跑插件自带的 Tools\\Pack-CrossingVoid.ps1（日志在下面实时滚动，结束自动刷新报告）"))
 				.OnClicked(FOnClicked::CreateSP(this, &SCrossingChunkPanel::OnPackClicked))
 			]
 			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2.f, 0.f)
@@ -1147,7 +1147,7 @@ SCrossingChunkPanel::~SCrossingChunkPanel()
 
 	FString SCrossingChunkPanel::BuildPackCommand() const
 {
-	const FString Script = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TEXT("Tools/Pack-CrossingVoid.ps1"));
+	const FString Script = FCrossingChunkRuleService::GetScriptPath(TEXT("Pack-CrossingVoid.ps1"));
 	// 服务器目标没有"版本/补丁"概念（出散件、走 git），统一按 Quick 传
 	const bool bServer = SelectedTarget.IsValid() && SelectedTarget->Target == TEXT("Server");
 	const FString Mode = (bServer || !SelectedMode.IsValid()) ? TEXT("Quick") : SelectedMode->Value;
@@ -1161,6 +1161,10 @@ SCrossingChunkPanel::~SCrossingChunkPanel()
 FString SCrossingChunkPanel::BuildExtraArgs() const
 {
 	FString Extra;
+	// 工程根：脚本自己也能推（从脚本位置向上找 .uproject），这里显式给一份，
+	// 是为了插件被装到 Engine\Plugins\ 下时（那种位置推不出工程）也能跑。
+	// 引号写法与下面同理。
+	Extra += FString::Printf(TEXT(" -ProjectRoot \\\"%s\\\""), *FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
 	// 这两个值最终会被塞进外层 -Command "..." 的双引号里，所以内层引号必须写成 \"。
 	// Windows 解析命令行时裸引号会被吃掉，PowerShell 收到就成了裸值：
 	//   · 逗号被当成数组分隔符 -> -Maps 绑不定 [string]（实测报 ParameterArgumentTransformationError）
@@ -1196,20 +1200,20 @@ FString SCrossingChunkPanel::BuildExtraArgs() const
 
 FString SCrossingChunkPanel::BuildClearCacheCommand() const
 {
-	const FString Script = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TEXT("Tools/Pack-CrossingVoid.ps1"));
-	return FString::Printf(TEXT("& '%s' -ClearCache"), *Script);
+	const FString Script = FCrossingChunkRuleService::GetScriptPath(TEXT("Pack-CrossingVoid.ps1"));
+	return FString::Printf(TEXT("& '%s' -ClearCache -ProjectRoot \\\"%s\\\""), *Script, *FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
 }
 
 FString SCrossingChunkPanel::BuildStatusCommand() const
 {
-	const FString Script = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TEXT("Tools/Pack-CrossingVoid.ps1"));
+	const FString Script = FCrossingChunkRuleService::GetScriptPath(TEXT("Pack-CrossingVoid.ps1"));
 	const FString Platform = SelectedTarget.IsValid() ? SelectedTarget->Platform : TEXT("Win64");
 	const FString Target = SelectedTarget.IsValid() ? SelectedTarget->Target : TEXT("Client");
 	const FString Mode = SelectedMode.IsValid() ? SelectedMode->Value : TEXT("Quick");
 	// 内层引号要写成 \"（原因见 BuildExtraArgs）
 	return FString::Printf(
-		TEXT("& '%s' -Status -Mode %s -Platform %s -Target %s -ReleaseVersion \\\"%s\\\" -ArchiveDir \\\"%s\\\" -ReleaseRoot \\\"%s\\\""),
-		*Script, *Mode, *Platform, *Target, *GetReleaseVersion(), *OutputDir, *ReleaseRoot);
+		TEXT("& '%s' -Status -ProjectRoot \\\"%s\\\" -Mode %s -Platform %s -Target %s -ReleaseVersion \\\"%s\\\" -ArchiveDir \\\"%s\\\" -ReleaseRoot \\\"%s\\\""),
+		*Script, *FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()), *Mode, *Platform, *Target, *GetReleaseVersion(), *OutputDir, *ReleaseRoot);
 }
 
 FString SCrossingChunkPanel::DeriveReleaseVersion(const FString& InPlayerVersion)
@@ -1494,7 +1498,7 @@ FReply SCrossingChunkPanel::OnClearCacheClicked()
 		return FReply::Handled();
 	}
 
-	const FString Script = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TEXT("Tools/Pack-CrossingVoid.ps1"));
+	const FString Script = FCrossingChunkRuleService::GetScriptPath(TEXT("Pack-CrossingVoid.ps1"));
 	if (!FPaths::FileExists(Script))
 	{
 		StatusMessage = FString::Printf(TEXT("找不到打包脚本：%s"), *Script);
@@ -1538,7 +1542,7 @@ FReply SCrossingChunkPanel::OnPackClicked()
 		return FReply::Handled();
 	}
 
-	const FString Script = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / TEXT("Tools/Pack-CrossingVoid.ps1"));
+	const FString Script = FCrossingChunkRuleService::GetScriptPath(TEXT("Pack-CrossingVoid.ps1"));
 	if (!FPaths::FileExists(Script))
 	{
 		StatusMessage = FString::Printf(TEXT("找不到打包脚本：%s"), *Script);
