@@ -10,12 +10,14 @@ struct FCrossingChunkRule;
 class FCrossingChunkLogMarshaller;   // 日志着色（定义在 .cpp 里，照引擎 Output Log 的做法）
 
 /**
- * 《二游打包》页（第一版）：显示分块规则 + 改名。
+ * 《二游打包》页。
  *
- * 接下来要加的（按设计文档 `Docs\2026-09-19-二游打包页设计.md`）：
- *   · chunk 体积/变化（读 Saved\PackLogs\ChunkReports\...\latest.json）
- *   · 未分类清单 + 一键指派
- *   · 打包按钮 + 实时日志
+ * 左栏：分块规则（号 / 名字 / 分类 / 目录数 / 文件数 / 体积 / 变化 / 解散）、
+ *       目标 × 模式、地图勾选、输出目录 / 版本 / 基线、状态行。
+ * 右栏：未分类清单（《版本更新》下换成待划分的补丁批次）、实时打包日志。
+ *
+ * 规则读写走 FCrossingChunkRuleService；打包、清缓存、状态查询全部交给
+ * 插件自带的 Tools\*.ps1 —— 这一页只负责拼命令、起进程、把结果读回来显示。
  */
 class SCrossingChunkPanel : public SCompoundWidget
 {
@@ -28,13 +30,25 @@ public:
 		int32 Added = 0;
 		int32 Removed = 0;
 		int32 Modified = 0;
+		/** kind == "unclassified"：脚本那个兜底块（本次新增自动）。它的号没写进规则，
+		 *  但已经随包发出去过 —— 登记「版本补丁N」时要避开它。 */
+		bool bIsUnclassified = false;
 	};
 
 	struct FUnclassFolder
 	{
 		FString Folder;
 		int32 Files = 0;
-		bool bIsNew = true;
+	};
+
+	/**
+	 * 一个「版本补丁N」分块（《常规补丁》自动登记出来的批次）。
+	 * 《版本更新》下右栏要把它平铺出来，好一个个「指派到」正式分块 —— 分不干净不让打包。
+	 */
+	struct FPatchBatch
+	{
+		FString Label;                                  // 版本补丁1 · chunk 40（49 个目录）
+		TArray<TSharedPtr<FUnclassFolder>> Folders;      // 每个目录一行，复用未分类那套行控件
 	};
 
 	/** 地图勾选项（勾中的会拼成脚本的 -Maps；一个都不勾 = 用 DefaultGame.ini 的 +MapsToCook）。 */
@@ -69,13 +83,13 @@ private:
 	TSharedRef<SWidget> MakeUnclassRow(TSharedPtr<FUnclassFolder> Item);
 
 	FReply OnRefreshClicked();
+	/** 「重新扫描」未分类清单：实时对比当前规则与 AssetRegistry，不依赖打包报告。 */
+	FReply OnRescanUnclassClicked();
 	FReply OnPackClicked();
 	/** 《清除缓存》：删掉能再生的缓存目录（脚本的 -ClearCache），腾磁盘空间。 */
 	FReply OnClearCacheClicked();
 	/** 中止正在跑的打包：杀进程树，并把被临时改写的地图清单还原回去。 */
 	void StopPack();
-	/** 打包结束后把临时关掉的 Live Coding 恢复回来。 */
-	void RestoreLiveCodingAfterPack();
 
 	/** 记住/恢复上次的选项（输出目录、目标、模式、勾选的地图），存在编辑器用户配置里。 */
 	void ApplySavedSettings();
@@ -88,11 +102,20 @@ private:
 	FReply OnDisbandClicked(int32 ChunkId);
 	FReply OnUndoDisbandClicked();
 	void OnNameCommitted(const FText& NewText, ETextCommit::Type CommitType, int32 ChunkId);
+	/** 提交分类变更（空 = 未分组）；刷新推迟到下一帧（下拉回调里不能当场重建整棵树）。 */
+	void CommitCategory(int32 ChunkId, const FString& NewCategory);
+	/** 分类下拉选了「新建分类…」：在旁边弹一个小输入框，回车即建。 */
+	void OpenNewCategoryPopup(int32 ChunkId);
+	void OnNewCategoryCommitted(const FText& NewText, ETextCommit::Type CommitType, int32 ChunkId);
 	FText GetSummaryText() const;
 	FText GetPackButtonText() const;
 	FText GetMapSummaryText() const;
 	/** 「Cook 进程数」右边那行说明（单进程 / 多进程各写各的）。 */
 	FText GetCookProcessCountHint() const;
+	/** 表格上方那行「变化基准：…」的文字（基准旧了会多一句解释）。 */
+	FText GetDeltaBaseText() const;
+	/** 上面那行的颜色：基准旧了 / 上次打包失败 → 标黄。 */
+	FSlateColor GetDeltaBaseColor() const;
 
 	/**
 	 * 打包期间要不要让按钮 / 输入框可用。
@@ -149,6 +172,58 @@ private:
 	/** 读最近一次打包报告（没有就留空，页面只显示规则本身）。 */
 	void LoadReport();
 
+	/**
+	 * 实时扫 AssetRegistry，列出当前没被任何分块规则覆盖的资源目录。
+	 * 按「顶层未覆盖目录」归组：规则标记是继承的（父目录被标记则子目录也算已归类），
+	 * 所以未覆盖的目录必然整条祖先链都没标记 —— 归组收敛到 /Game 的第一层子目录，
+	 * 正好是「拆散后重新分配」的操作粒度。
+	 */
+	void RescanUnclassified();
+
+	/**
+	 * 《常规补丁》专有：把"当前没有任何规则覆盖的目录"登记成一条新规则「版本补丁N」，
+	 * 写进 Config\DefaultCrossingChunk.ini。返回 false 时 OutMessage 里带原因
+	 * （"没有未分类目录"也算 false，那是正常情况）。
+	 *
+	 * 为什么必须登记：脚本对未分类文件只能无脑兜底到一个号（规则里 max(ChunkId)+1），
+	 * 规则不动那个号就永远不变 —— 每批新资源都挤进同一块，补丁只会越来越大。
+	 * 为什么只能在面板侧登记：脚本跑在 cook **之前**，那时它不知道哪些文件是"这次新来的"，
+	 * 只有面板扫 AssetRegistry 才知道。必须在打包之前调用（脚本是 cook 前读规则文件的）。
+	 */
+	bool RegisterPatchBatch(FString& OutMessage);
+
+	/**
+	 * 扫出所有「版本补丁N」分块及其目录（每个目录带当前资产数）。两个用途：
+	 *   · 《版本更新》下右栏把它们平铺出来，供「指派到」正式分块；
+	 *   · 《版本更新》点打包时的硬拦（补丁批次没清干净就不启动）。
+	 * 判据是名字前缀，不往规则里加字段。
+	 */
+	void RescanPatchBatches();
+
+	/** 右栏那块列表的标题：有补丁批次时换成"待正式划分…"。 */
+	FText GetUnclassBoxTitle() const;
+
+	/**
+	 * 右栏现在该不该把「待正式划分」的补丁批次顶上来 ——
+	 * 只有《版本更新》模式下才顶（那时候要做正式划分）；《常规补丁》下右栏要显示的是
+	 * 未分类清单（那才是这次要登记成新批次的料）。
+	 */
+	bool ShouldShowPatchBatches() const
+	{
+		return PatchBatches.Num() > 0
+			&& SelectedMode.IsValid() && SelectedMode->Value == TEXT("Base");
+	}
+
+	/**
+	 * 「开始打包」能不能点。
+	 * 打包进行中必须能点（那时它是「停止打包」）；《版本更新》下还有补丁批次就先灰掉 ——
+	 * 也就是"不处理不让打包"，只不过拦在按钮上，比点下去再弹窗更直白。
+	 */
+	bool CanStartPack() const
+	{
+		return bPacking || !ShouldShowPatchBatches();
+	}
+
 	/** 下拉项：中文标签 + 真正传给脚本的值。 */
 	struct FChoice
 	{
@@ -161,10 +236,40 @@ private:
 
 	TArray<TSharedPtr<FCrossingChunkRule>> Rows;
 	TSharedPtr<SVerticalBox> RowsBox;
+	/** 分类下拉的选项（所有行共用）：未分组 + 现有分类 + 「新建分类…」（nullptr 哨兵）。 */
+	TArray<TSharedPtr<FString>> CategoryOptions;
+	/** 变化列的统一宽度：跟随全表最宽的变化内容（各行同宽，解散按钮才能对齐）。 */
+	float DeltaColumnWidth = 110.f;
+	/** 右栏「本次变更」里「N 个文件」那一列的统一宽度（按最宽的一条算，按钮才不会跟着数字位数左右跳）。 */
+	float UnclassCountWidth = 90.f;
 	TArray<TSharedPtr<FUnclassFolder>> Unclassified;
+	/** 上面那份清单背后的**精确目录**（形如 /Game/AssetMaterial/Sound/UI_Effect，不是右栏显示的锚点）——
+	 *  「版本补丁N」按它登记：锚点会把整棵树永久认领，以后往老目录里塞新文件就再也不会被认成新的一批。 */
+	TArray<FString> UncoveredFolders;
+	/** 现有的「版本补丁N」批次（《版本更新》下右栏显示它们、并据此硬拦打包）。 */
+	TArray<TSharedPtr<FPatchBatch>> PatchBatches;
 	TSharedPtr<SVerticalBox> UnclassBox;
 	TMap<int32, FReportChunk> ReportChunks;
-	FString ReportStamp;
+
+	// ---- 「变化」列的对比基准 ----
+	// 变化列 = 和 latest.json 里那份报告比，而 latest.json 只在【打包成功】时才刷新
+	// （Pack-CrossingVoid.ps1 把生成报告的调用放在退出码 0 的分支里）。所以打包失败后
+	// 基准会悄悄停在更早那份，界面上却看不出来 —— 「增 N / 改 N」就会被读成"这次打包
+	// 带来的变化"，实际可能是好几周的累计（2026-10-11 就是这么被问住的）。
+	// 结论：基准是哪一份、隔了多久，必须显示出来。
+	bool bReportLoaded = false;   // latest.json 读到了吗（没有 = 这一列本来就是「—」）
+	/** 报告里 containerStats：有没有容器体积可量。安卓 false（pak 打进 APK/OBB）→
+	 *  体积列显示「不统计」；文件数 / 变化 不受影响。老报告没有这个字段，按 true 处理。 */
+	bool bContainerStats = true;
+	FString DeltaBaseId;          // 报告里的 previousReport，例：20260920-013942-Base
+	FString DeltaBaseLabel;       // 例：09-20 01:39
+	FString DeltaBaseAgeText;     // 例：21 天前 / 昨天 / 今天
+	int32 DeltaBaseAgeDays = -1;  // -1 = 没有基准，或报告 id 里的时间读不出来
+	bool bDeltaBaseExists = false;
+	/** 本会话里最近一次打包是不是失败了（失败时基准没刷新，那行要提醒）。 */
+	bool bLastPackFailed = false;
+	/** 基准旧到这个天数就标黄：那已经不是"本次改动"，是攒下来的。 */
+	static constexpr int32 StaleDeltaBaseDays = 3;
 	FString StatusMessage;
 	int32 FolderTotal = 0;
 
@@ -205,6 +310,4 @@ private:
 	bool bPacking = false;
 	/** 当前这一轮是清缓存（决定结束时的提示文案）。 */
 	bool bRunIsClearCache = false;
-	/** 打包期间是否临时关掉了 Live Coding（打完要恢复）。 */
-	bool bDisabledLiveCoding = false;
 };

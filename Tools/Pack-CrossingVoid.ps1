@@ -20,32 +20,33 @@
 .PARAMETER Mode
     Base    首次发布基线包（-createreleaseversion）
     Patch   补丁包，产 _P.pak（需要已存在的基线）
-    Quick   不建基线版本，只验证 chunk 生不生效（快很多）
+    Quick   不建基线版本，只验证 chunk 生不生效（不打 pak，快很多）
 
     三个模式都必须经过 stage —— pak 是从 staging 目录生成的，
     少了 -stage 会报 "Only staged builds can be paked"。
-    Shipping 目标缺失时会自动补 -build（第一次打包必然如此）。
+    Shipping 目标缺失或过期时，脚本先单独编译它，再让 UAT 带 -nocompile 跑。
     全量 cook 很慢，零境实测约 43 分钟；cook 缓存会复用于后续打包。
 
 .PARAMETER Target
-    打包目标类型，三选一：
+    打包目标类型：
       Client  客户端（玩家跑的包）
-      Server  专用服务器（不带客户端资源的独立服务器）
-      Both    两者都打（各自一份产物，分目录）
+      Server  专用服务器（出散件、走 git，不分包）
+      Both    参数保留，但当前会直接报错 —— 见下面
 
     对应关系：
-      Client → -clientconfig=Shipping -client
+      Client → -clientconfig=Shipping
       Server → -serverconfig=Shipping -server
-      Both   → 两次 BuildCookRun，分别产到 Client\ / Server\ 子目录
+      Both   → 服务器要关 ZenStore 才出得来散件，客户端分包必须开 ZenStore，
+               两者不能在同一次打包里共存，所以脚本直接拒绝；请分两次打。
 
-    服务器目标依赖 Source\CrossingVoidServer.Target.cs（Type=TargetType.Server），工程里已有。
+    服务器目标依赖 Source\<工程名>Server.Target.cs（Type=TargetType.Server）；没有就退回 <工程名>Server，让 UAT 报 target 不存在。
 
 .PARAMETER Platform
     Win64 / Android
-    注意：Server 目标只在 Win64 与 Linux 上有意义；Android 不支持专用服务器。
+    注意：Server 目标只在 Win64 上有意义；Android 不支持专用服务器。
 
 .PARAMETER ReleaseVersion
-    Base 模式必填（如 1.0）。基线会落在 <工程>\Releases\<版本>\<平台>\。
+    Base 模式必填（如 1.0）。基线会落在 <ReleaseRoot>\<版本>\<平台>\。
     Patch 模式也必填 —— 必须指明「基于哪个基线版本」算差异，引擎强制要求
     （只给 -generatepatch 不给 -basedonreleaseversion 会直接抛异常）。
 
@@ -160,6 +161,25 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# 中途抛错也要把临时改写的 DefaultGame.ini 还原回去（地图清单 / 服务器散件开关共用一份备份）。
+# 正常收尾在脚本末尾还原；这个 trap 管的是"没走到收尾就失败"的情况 ——
+# 否则工程配置会停在「只 cook 勾选的那几张地图 / Zen 被关掉」的临时状态。
+trap {
+    if ($bGameIniOverridden -and $GameIniBackupPath -and (Test-Path -LiteralPath $GameIniBackupPath)) {
+        try {
+            Move-Item -LiteralPath $GameIniBackupPath -Destination $GameIniPath -Force
+            if ($ProjectRoot) {
+                Remove-Item -LiteralPath (Join-Path $ProjectRoot 'Saved\PackLogs\maps-override.txt') -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host '[配置] 出错，DefaultGame.ini 已还原' -ForegroundColor Yellow
+        }
+        catch {
+            Write-Host ("[配置] 还原 DefaultGame.ini 失败：{0}" -f $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+    throw
+}
+
 # ============================ 固定路径 ============================
 # 工程根不再写死。本脚本会被放在两处，都要能自己推出来：
 #   <工程>\Tools\                              —— 旧布局（脚本挂在工程里）
@@ -186,7 +206,54 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
     }
 }
 $ProjectRoot = $ProjectRoot.TrimEnd('\', '/')
-$ProjectFile = Join-Path $ProjectRoot 'CrossingVoid.uproject'
+
+# ---- 工程文件：不再写死 CrossingVoid.uproject ----
+# 工程根下通常只有一个 .uproject；有多个时优先用「和工程目录同名」的那个。
+$ProjectCandidates = @(Get-ChildItem -LiteralPath $ProjectRoot -Filter '*.uproject' -File -ErrorAction SilentlyContinue)
+if ($ProjectCandidates.Count -eq 0) {
+    throw "[检查失败] $ProjectRoot 下找不到 .uproject"
+}
+if ($ProjectCandidates.Count -eq 1) {
+    $ProjectFile = $ProjectCandidates[0].FullName
+}
+else {
+    $PreferredProject = $ProjectCandidates |
+        Where-Object { $_.BaseName -ieq (Split-Path $ProjectRoot -Leaf) } |
+        Select-Object -First 1
+    if (-not $PreferredProject) {
+        throw ("[检查失败] 工程根下有多个 .uproject，无法确定用哪个：`n  {0}" -f (($ProjectCandidates | ForEach-Object { $_.FullName }) -join "`n  "))
+    }
+    $ProjectFile = $PreferredProject.FullName
+}
+$ProjectName = [System.IO.Path]::GetFileNameWithoutExtension($ProjectFile)
+
+# ---- target 名：不再写死 CrossingVoid / CrossingVoidServer ----
+# 读 Source\*.Target.cs 里的 Type = TargetType.Game / Server：
+#   · 客户端优先用和工程同名的 Game 目标，没有就用第一个 Game 目标；
+#   · 服务器优先用 <工程名>Server，没有就用第一个 Server 目标；
+#   · 一个 Server 目标都没有时退回 <工程名>Server —— 真去打服务器会让 UAT 报
+#     「target 不存在」，比在这里猜一个能编的目标更清楚。
+function Get-TargetBaseName {
+    param($File)
+    return ($File.Name -replace '\.Target\.cs$', '')
+}
+
+$TargetFiles = @(Get-ChildItem -LiteralPath (Join-Path $ProjectRoot 'Source') -Filter '*.Target.cs' -File -ErrorAction SilentlyContinue)
+$GameTargets = @($TargetFiles | Where-Object {
+        (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue) -match 'Type\s*=\s*TargetType\.Game'
+    })
+$ServerTargets = @($TargetFiles | Where-Object {
+        (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue) -match 'Type\s*=\s*TargetType\.Server'
+    })
+
+$PreferredGame = $GameTargets | Where-Object { (Get-TargetBaseName $_) -ieq $ProjectName } | Select-Object -First 1
+if (-not $PreferredGame) { $PreferredGame = $GameTargets | Select-Object -First 1 }
+$ClientTargetName = if ($PreferredGame) { Get-TargetBaseName $PreferredGame } else { $ProjectName }
+
+$PreferredServer = $ServerTargets | Where-Object { (Get-TargetBaseName $_) -ieq "$($ProjectName)Server" } | Select-Object -First 1
+if (-not $PreferredServer) { $PreferredServer = $ServerTargets | Select-Object -First 1 }
+$ServerTargetName = if ($PreferredServer) { Get-TargetBaseName $PreferredServer } else { "$($ProjectName)Server" }
+
 $EngineRoot  = 'D:\UnrealEngine-5.8.2'
 $RunUAT      = Join-Path $EngineRoot 'Engine\Build\BatchFiles\RunUAT.bat'
 
@@ -611,7 +678,8 @@ if ($Platform -eq 'Android' -and $Target -ne 'Client') {
 function Build-UatArgs {
     param(
         [string]$PackTarget,      # Client 或 Server
-        [string]$OutDir
+        [string]$OutDir,
+        [string]$TargetName       # 本次要打的 target 名（从 Source\*.Target.cs 推出来）
     )
 
     $args = [System.Collections.Generic.List[string]]::new()
@@ -626,7 +694,7 @@ function Build-UatArgs {
     # UAT 靠这个参数认游戏 target。不传的话 -cook 会直接抛
     # "Game target not found. Game target is required with -cook or -cookonthefly"
     # （-client / -server 只说明要打哪一侧，不提供 target 名）。
-    $args.Add("-target=$(if ($PackTarget -eq 'Server') { 'CrossingVoidServer' } else { 'CrossingVoid' })")
+    $args.Add("-target=$TargetName")
 
     # ---- 选定的地图（空则交给 ini 的 +MapsToCook）----
     if (-not [string]::IsNullOrWhiteSpace($Maps)) {
@@ -652,11 +720,9 @@ function Build-UatArgs {
     }
 
     # ---- 检查 Shipping 目标是否存在 ----
-    # stage 需要 <工程>\Binaries\Win64\CrossingVoid-Win64-Shipping.target
-    # 服务器需要 CrossingVoidServer-Win64-Shipping.target
+    # stage 需要 <工程>\Binaries\Win64\<TargetName>-Win64-Shipping.target
     $NeedBuild = $true
     if ($Platform -eq 'Win64') {
-        $TargetName = if ($PackTarget -eq 'Server') { 'CrossingVoidServer' } else { 'CrossingVoid' }
         $ShippingTarget = Join-Path $ProjectRoot "Binaries\Win64\$TargetName-Win64-Shipping.target"
         if (Test-Path -LiteralPath $ShippingTarget) { $NeedBuild = $false }
     }
@@ -739,7 +805,7 @@ function Build-UatArgs {
                 throw "[参数缺失] Base 模式必须指定 -ReleaseVersion，例如：-ReleaseVersion 1.0"
             }
 
-            # 基线目录：<工程>\Releases\<版本>\<平台>\
+            # 基线目录：<ReleaseRoot>\<版本>\<平台>\
             # 服务器与客户端各占一个子目录，避免互相覆盖
             $ReleaseSub = if ($PackTarget -eq 'Server') { "$PlatformDir-Server" } else { $PlatformDir }
             # 基线根目录可能在界面上被换成新位置 → 先确保它存在（UAT 只负责往里写版本子目录）
@@ -767,8 +833,7 @@ function Build-UatArgs {
 
             # ---- 基线必须干净：给 cook 缓存做一次体检（方案 C）----
             # 脏了就自动全量（-clean），干净就照走增量 —— 不用人再想"这次该用哪种"。
-            $ProjName = [System.IO.Path]::GetFileNameWithoutExtension($ProjectFile)
-            $Cache = Test-CookCacheDirty -Root $ProjectRoot -CookPlatform $PlatformDir -Name $ProjName
+            $Cache = Test-CookCacheDirty -Root $ProjectRoot -CookPlatform $PlatformDir -Name $ProjectName
             if ($Cache.Dirty) {
                 $AutoClean = $true
                 Write-Host ("[缓存] {0} 个已烘焙文件里有 {1} 个在工程里已经不存在 -> 这次自动全量重 cook" -f $Cache.Cooked, $Cache.Orphans.Count) -ForegroundColor Yellow
@@ -878,7 +943,7 @@ if (-not (Test-Path -LiteralPath $LogDir)) {
 # 只能在打包期间把 ini 里那份清单换成勾选的那几张，打完立刻还原。
 $GameIniPath = Join-Path $ProjectRoot 'Config\DefaultGame.ini'
 # 备份一份原件；下面「地图清单」和「服务器散件」两处改写共用这一份，跑完统一还原
-$GameIniBackupPath = Join-Path $ProjectRoot 'Config\DefaultGame.ini.bak-tmp'
+$GameIniBackupPath = Join-Path $ProjectRoot 'Config\DefaultGame.ini.bak-maps-tmp'
 $bGameIniOverridden = $false
 
 if (-not $DryRun -and -not [string]::IsNullOrWhiteSpace($Maps)) {
@@ -949,27 +1014,67 @@ if ($bLooseServerPack) {
             $bGameIniOverridden = $true
         }
 
+        # ---- 临时把打包方式切成散件 ----
+        # 这三个键不一定写在 DefaultGame.ini 里（UE 的默认值是 True，很多工程只显式写其中一两个）。
+        # 所以不能"找不到就报错"：已有的改成 False，缺的补进 [ProjectPackagingSettings] 段。
+        # 只动这个段里的键，别碰同名但属于别的段的配置。
         $LooseKeys = @('UsePakFile', 'bUseIoStore', 'bUseZenStore')
-        $NewLines = [System.Collections.Generic.List[string]]::new()
+        $PackagingSection = '[/Script/UnrealEd.ProjectPackagingSettings]'
+        $Lines = [System.Collections.Generic.List[string]]@(Get-Content -LiteralPath $GameIniPath -Encoding UTF8)
         $Seen = @{}
-        foreach ($Line in (Get-Content -LiteralPath $GameIniPath -Encoding UTF8)) {
-            $t = $Line.Trim()
-            $Hit = $null
-            foreach ($k in $LooseKeys) {
-                if ($t -match ('^' + [regex]::Escape($k) + '\s*=')) { $Hit = $k; break }
-            }
-            if ($Hit) {
-                if (-not $Seen.ContainsKey($Hit)) { $NewLines.Add("$Hit=False"); $Seen[$Hit] = $true }
+        $InPackaging = $false
+        $LastSectionHeader = -1
+
+        for ($i = 0; $i -lt $Lines.Count; $i++) {
+            $t = $Lines[$i].Trim()
+            if ($t.StartsWith('[') -and $t.EndsWith(']')) {
+                $InPackaging = ($t -ieq $PackagingSection)
+                if ($InPackaging) { $LastSectionHeader = $i }
                 continue
             }
-            $NewLines.Add($Line)
+            if (-not $InPackaging) { continue }
+
+            foreach ($k in $LooseKeys) {
+                if ($t -match ('^' + [regex]::Escape($k) + '\s*=')) {
+                    $Lines[$i] = "$k=False"
+                    $Seen[$k] = $true
+                    break
+                }
+            }
         }
-        # 找不到就不动手：宁可报错，也不要在 Zen 还开着的情况下打出一个空包
+
+        # 缺的键补到「最后一个」ProjectPackagingSettings 段末尾：
+        # 段可能不止一个（这个工程就有两段），放在最后一段能确保它后面没有同名值覆盖。
+        $Missing = @($LooseKeys | Where-Object { -not $Seen.ContainsKey($_) })
+        if ($Missing.Count -gt 0) {
+            if ($LastSectionHeader -lt 0) {
+                $Lines.Add('')
+                $Lines.Add($PackagingSection)
+                foreach ($k in $Missing) { $Lines.Add("$k=False") }
+            }
+            else {
+                $InsertAt = $Lines.Count
+                for ($i = $LastSectionHeader + 1; $i -lt $Lines.Count; $i++) {
+                    $t = $Lines[$i].Trim()
+                    if ($t.StartsWith('[') -and $t.EndsWith(']')) { $InsertAt = $i; break }
+                }
+                for ($j = 0; $j -lt $Missing.Count; $j++) {
+                    $Lines.Insert($InsertAt + $j, "$($Missing[$j])=False")
+                }
+            }
+        }
+
+        # 写完自检：三个键都必须以 False 出现，缺一个都说明这次改动没落全
         foreach ($k in $LooseKeys) {
-            if (-not $Seen.ContainsKey($k)) { throw "[服务器散件] DefaultGame.ini 里找不到 $k= 这一行，拒绝继续" }
+            $HasFalse = $false
+            foreach ($line in $Lines) {
+                if ($line.Trim() -match ('^' + [regex]::Escape($k) + '\s*=\s*False\s*$')) { $HasFalse = $true; break }
+            }
+            if (-not $HasFalse) { throw "[服务器散件] 写入 $k=False 失败，拒绝继续" }
         }
-        [System.IO.File]::WriteAllLines($GameIniPath, $NewLines, (New-Object System.Text.UTF8Encoding($true)))
-        Write-Host '[服务器散件] 临时关掉 UsePakFile / bUseIoStore / bUseZenStore（打完自动还原）' -ForegroundColor Yellow
+
+        [System.IO.File]::WriteAllLines($GameIniPath, $Lines, (New-Object System.Text.UTF8Encoding($true)))
+        Write-Host ("[服务器散件] 临时关掉打包容器：{0}（缺的键已补进 {1}；打完自动还原）" -f ($LooseKeys -join ' / '), $PackagingSection) -ForegroundColor Yellow
 
         # 顺手清掉服务器自己那份 cooked：上次是 Zen 管线（盘上只有 Metadata，没有 .uasset），
         # 增量 cook 会以为"已经 cook 过"从而跳过，这次照样出不来散件。
@@ -1068,11 +1173,37 @@ function Get-NewestProjectSource {
     return [pscustomobject]@{ Time = $newest; Path = $newestPath }
 }
 
+# 收据（*.target）里记着这次构建用的**插件描述符绝对路径**（"Path": "$(ProjectDir)/Plugins/X/X.uplugin"，
+# Type: UFS），UAT 的 staging 会照着它逐个 PluginDescriptor.FromFile 去读
+# （CopyBuildToStagingDirectory.Automation.cs:1936）。收据只有"真编一次"才会重写，所以插件目录改名/搬家
+# 之后它就是一张过期地图 ⇒ staging 直接 DirectoryNotFoundException：
+#   2026-10-11 就是这么炸的 —— Plugins\DreamGameplayTask-master 改名成 DreamGameplayTask，
+#   而 Android 收据还是 9/19 写的；Android 分支原来"有收据就不编"，于是打包死在 staging。
+# 时间戳比较抓不到这一类（改名不动 mtime），所以单独查一遍路径还在不在。
+function Test-ReceiptPluginPaths {
+    param([Parameter(Mandatory)][string]$ReceiptPath)
+
+    $missing = @()
+    if (-not (Test-Path -LiteralPath $ReceiptPath)) {
+        return [pscustomobject]@{ Valid = $true; Missing = $missing }
+    }
+
+    $text = Get-Content -LiteralPath $ReceiptPath -Raw -Encoding utf8
+    foreach ($m in [regex]::Matches($text, '"Path"\s*:\s*"\$\(ProjectDir\)/(Plugins/[^"]+\.uplugin)"')) {
+        $relative = $m.Groups[1].Value -replace '/', '\'
+        if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot $relative))) {
+            $missing += $relative
+        }
+    }
+    return [pscustomobject]@{ Valid = ($missing.Count -eq 0); Missing = $missing }
+}
+
 $AllOk = $true
 
 foreach ($Run in $RunList) {
     $PackTarget = $Run.Name
     $OutDir     = $Run.OutDir
+    $TargetName = if ($PackTarget -eq 'Server') { $ServerTargetName } else { $ClientTargetName }
 
     # ---- 目标 Shipping 二进制缺失时：先【单独】把它编出来 ----
     # 关键点：不要交给 UAT 的 -build。UAT 那一次 UBT 调用会同时带上
@@ -1082,7 +1213,7 @@ foreach ($Run in $RunList) {
     # 单独编本目标时，UBT 只检查本目标的互斥体 —— 服务器目标的互斥体编辑器并不持有，
     # 所以能编过。这样用户不用关编辑器，打包也不碰 Live Coding。
     if ($Platform -eq 'Win64') {
-        $ReceiptName = if ($PackTarget -eq 'Server') { 'CrossingVoidServer' } else { 'CrossingVoid' }
+        $ReceiptName = $TargetName
         $ReceiptPath = Join-Path $ProjectRoot "Binaries\Win64\$ReceiptName-Win64-Shipping.target"
         $ShippingExe = Join-Path $ProjectRoot "Binaries\Win64\$ReceiptName-Win64-Shipping.exe"
 
@@ -1104,6 +1235,14 @@ foreach ($Run in $RunList) {
             if ($NewestSrc.Time -and ($NewestSrc.Time -gt $BinaryStamp)) {
                 $NeedCompile = $true
                 $WhyCompile  = ('源码比 Shipping 二进制新：{0}（源码 {1:yyyy-MM-dd HH:mm:ss} / 二进制 {2:yyyy-MM-dd HH:mm:ss}）' -f (Split-Path $NewestSrc.Path -Leaf), $NewestSrc.Time, $BinaryStamp)
+            }
+            else {
+                # 时间戳抓不到"插件目录改名/搬家"（改名不动 mtime），而收据里记的是绝对路径 —— 单独查一遍
+                $ReceiptCheck = Test-ReceiptPluginPaths -ReceiptPath $ReceiptPath
+                if (-not $ReceiptCheck.Valid) {
+                    $NeedCompile = $true
+                    $WhyCompile  = ('收据里记的插件路径已不存在：{0}（收据是上次构建时写的，插件目录改过名/搬过家 —— staging 会照着这张过期地图去读）' -f ($ReceiptCheck.Missing -join '、'))
+                }
             }
         }
         if ($ForceBuild) {
@@ -1155,23 +1294,66 @@ foreach ($Run in $RunList) {
         }
     }
     else {
-        # ---- 安卓：同理，Shipping 目标缺失时单独编它 ----
+        # ---- 安卓：同理，目标缺失**或过期**时单独编它 ----
         # 为什么必须单独编：打包一律带 -nocompile，UAT 不会替我们编译；
         # 而第一次打安卓时 Binaries\Android 下根本没有产物，不先编出来必然失败。
-        $ReceiptName = if ($PackTarget -eq 'Server') { 'CrossingVoidServer' } else { 'CrossingVoid' }
+        #
+        # 2026-10-11 补上"过期"这一半：原来这里只看收据**在不在**，于是插件改名 / 源码更新之后照样
+        # 跳过编译 ⇒ staging 拿着 9/19 那张收据去读已经改名的插件目录，直接 DirectoryNotFoundException。
+        # Win64 分支 2026-09-19 已经吃过"收据在 = 二进制新"的亏（见 Get-NewestProjectSource 的注释），
+        # 安卓这边现在按同一套判断：源码比二进制新，或收据里记的插件路径已不存在。
+        $ReceiptName = $TargetName
         $AndroidBin = Join-Path $ProjectRoot 'Binaries\Android'
-        $HasAndroidShipping = $false
+        $AndroidReceipt = $null
         if (Test-Path -LiteralPath $AndroidBin) {
-            $HasAndroidShipping = [bool](Get-ChildItem -LiteralPath $AndroidBin -Filter "$ReceiptName-Android*Shipping*.target" -ErrorAction SilentlyContinue |
-                Select-Object -First 1)
+            $AndroidReceipt = Get-ChildItem -LiteralPath $AndroidBin -Filter "$ReceiptName-Android*Shipping*.target" -ErrorAction SilentlyContinue |
+                Select-Object -First 1
         }
         # 有的版本收据名不带平台后缀，兜一层
-        if (-not $HasAndroidShipping -and (Test-Path -LiteralPath $AndroidBin)) {
-            $HasAndroidShipping = [bool](Get-ChildItem -LiteralPath $AndroidBin -Filter '*Shipping*.target' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (-not $AndroidReceipt -and (Test-Path -LiteralPath $AndroidBin)) {
+            $AndroidReceipt = Get-ChildItem -LiteralPath $AndroidBin -Filter '*Shipping*.target' -ErrorAction SilentlyContinue |
+                Select-Object -First 1
         }
-        if (-not $HasAndroidShipping) {
+
+        $NeedAndroidBuild = $false
+        $WhyAndroidBuild  = ''
+        if (-not $AndroidReceipt) {
+            $NeedAndroidBuild = $true
+            $WhyAndroidBuild  = "$ReceiptName 的 Android Shipping 目标还没编过（第一次会比较久：arm64 + 引擎模块）"
+        }
+        else {
+            $AndroidSo = Get-ChildItem -LiteralPath $AndroidBin -Filter "$ReceiptName-Android*Shipping*.so" -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $AndroidSo) {
+                $NeedAndroidBuild = $true
+                $WhyAndroidBuild  = 'Android Shipping 二进制（*.so）不存在，只剩收据'
+            }
+            else {
+                $NewestSrc = Get-NewestProjectSource
+                if ($NewestSrc.Time -and ($NewestSrc.Time -gt $AndroidSo.LastWriteTime)) {
+                    $NeedAndroidBuild = $true
+                    $WhyAndroidBuild  = ('源码比 Android 二进制新：{0}（源码 {1:yyyy-MM-dd HH:mm:ss} / 二进制 {2:yyyy-MM-dd HH:mm:ss}）' -f (Split-Path $NewestSrc.Path -Leaf), $NewestSrc.Time, $AndroidSo.LastWriteTime)
+                }
+                else {
+                    # 时间戳抓不到"插件目录改名/搬家"（改名不动 mtime），而收据里记的是绝对路径 —— 单独查一遍
+                    $ReceiptCheck = Test-ReceiptPluginPaths -ReceiptPath $AndroidReceipt.FullName
+                    if (-not $ReceiptCheck.Valid) {
+                        $NeedAndroidBuild = $true
+                        $WhyAndroidBuild  = ('收据里记的插件路径已不存在：{0}（收据是上次构建时写的，插件目录改过名/搬过家 —— staging 会照着这张过期地图去读）' -f ($ReceiptCheck.Missing -join '、'))
+                    }
+                }
+            }
+        }
+
+        # -ForceBuild 时编译交给 UAT 那一轮（Build-UatArgs 会保留 -build），这里就不再单独编一遍
+        if ($ForceBuild) { $NeedAndroidBuild = $false }
+
+        if ($NeedAndroidBuild -and $DryRun) {
+            Write-Host "[编译] (DryRun) 本应编译：$WhyAndroidBuild" -ForegroundColor Yellow
+        }
+        elseif ($NeedAndroidBuild) {
             Write-Host ''
-            Write-Host "[编译] $ReceiptName 的 Android Shipping 目标还没编过 —— 先单独编译它（第一次会比较久：arm64 + 引擎模块）" -ForegroundColor Yellow
+            Write-Host "[编译] $WhyAndroidBuild —— 先单独编译它（不会被 Live Coding 挡住，编辑器不用关）" -ForegroundColor Yellow
             $BuildBat = Join-Path $EngineRoot 'Engine\Build\BatchFiles\Build.bat'
             & $BuildBat $ReceiptName Android Shipping "-Project=$ProjectFile" -WaitMutex
             if ($LASTEXITCODE -ne 0) {
@@ -1183,6 +1365,9 @@ foreach ($Run in $RunList) {
             else {
                 Write-Host "[编译] 完成" -ForegroundColor Green
             }
+        }
+        else {
+            Write-Host ("[编译] {0} Android Shipping 目标是最新的，跳过编译" -f $ReceiptName) -ForegroundColor DarkGray
         }
     }
 
@@ -1205,7 +1390,7 @@ foreach ($Run in $RunList) {
         }
     }
 
-    $built    = Build-UatArgs -PackTarget $PackTarget -OutDir $OutDir
+    $built    = Build-UatArgs -PackTarget $PackTarget -OutDir $OutDir -TargetName $TargetName
     $uatArgs  = $built.Args
     $ArgString = ($uatArgs | ForEach-Object { "`"$_`"" }) -join ' '
 
@@ -1265,8 +1450,8 @@ foreach ($Run in $RunList) {
 
     # ============================ 产物盘点 ============================
     if ($ExitCode -eq 0) {
-        # 服务器产物的目录名带 Server 后缀，客户端不带
-        $SubName = if ($PackTarget -eq 'Server') { 'CrossingVoidServer' } else { 'CrossingVoid' }
+        # 归档目录名 = target 名（客户端 <工程名>，服务器 <工程名>Server）
+        $SubName = $TargetName
         $PaksDir = Join-Path $OutDir "$PlatformDir\$SubName\Content\Paks"
 
         # ---- 《快速验证》留个显眼的标记 ----
@@ -1438,10 +1623,39 @@ foreach ($Run in $RunList) {
                 Write-Host ''
                 Write-Host "  [清单] $ManifestOut" -ForegroundColor DarkGray
             }
+        }
+        else {
+            Write-Host ''
+            if ($Platform -eq 'Android') {
+                # 安卓把 pak 数据打进 APK/OBB（main.<版本>.<包名>.obb），产物目录里根本没有
+                # Content\Paks —— 这不是失败，只是「容器体积统计」这一项对安卓不适用。
+                # 清单归档和分包报告不受影响（见下面那一段）。
+                Write-Host '  （安卓：pak 打进 APK/OBB，没有 Content\Paks —— 容器体积统计跳过）' -ForegroundColor DarkGray
+                $AndroidRoot = Join-Path $OutDir $PlatformDir
+                $AndroidFiles = @(Get-ChildItem -LiteralPath $AndroidRoot -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -in '.apk', '.obb' })
+                if ($AndroidFiles.Count -gt 0) {
+                    Write-Host "[产物] $AndroidRoot" -ForegroundColor Yellow
+                    foreach ($f in $AndroidFiles) {
+                        Write-Host ('  {0,-54} {1,10:N1} MB' -f $f.Name, ($f.Length / 1MB))
+                    }
+                }
+            }
+            else {
+                Write-Host "[警告] 没找到产物目录：$PaksDir" -ForegroundColor Yellow
+                Write-Host '       检查 -archivedirectory 与平台目录名。' -ForegroundColor Yellow
+            }
+        }
 
-            # ---- 归档 staging 清单，然后生成分包报告 ----
-            # 注意：UAT 的 PrePak_<CookPlatform>_UFSFiles.txt 是**临时文件**，
-            # 下一次打包会清掉，所以必须在这里立刻归档 + 立刻算报告。
+        # ---- 归档 staging 清单 + 生成分包报告（客户端两个平台都做）----
+        # 这一段原来挂在「产物目录里有没有 Content\Paks」那个判定里，于是安卓永远走不到：
+        # 安卓没有 Content\Paks，整块（归档 + 报告）被一起跳过 —— 表现就是
+        # 「安卓从来没有分包报告」，页面在安卓平台永远显示「报告：还没有」。
+        # 现在把两件事解耦：「有没有容器可以量体积」只影响体积统计（上面那一段），
+        # 「有没有清单可以归档、可以算报告」两个平台都一样做。
+        # 注意：UAT 的 PrePak_<CookPlatform>_UFSFiles.txt 是**临时文件**，
+        # 下一次打包会清掉，所以必须在这里立刻归档 + 立刻算报告。
+        if ($PackTarget -ne 'Server') {
             $StagedList = Join-Path $EngineRoot "Engine\Programs\AutomationTool\Saved\Logs\PrePak_${PlatformDir}_UFSFiles.txt"
             $ArchiveSub = Join-Path $LogDir 'ManifestHistory'
             if (-not (Test-Path -LiteralPath $ArchiveSub)) {
@@ -1462,24 +1676,17 @@ foreach ($Run in $RunList) {
             }
 
             # ---- 分包报告（页面/AX 都读它）----
-            if ($PackTarget -ne 'Server') {
-                $ReportScript = Join-Path $PSScriptRoot 'Build-ChunkReport.ps1'
-                if (Test-Path -LiteralPath $ReportScript) {
-                    try {
-                        & $ReportScript -ProjectRoot $ProjectRoot -ArchiveDir $OutDir `
-                            -Platform $Platform -Target $PackTarget -Mode $Mode -PackLogPath $LogFile
-                    }
-                    catch {
-                        Write-Host "  [警告] 分包报告生成失败：$($_.Exception.Message)" -ForegroundColor Yellow
-                        Write-Host '         （打包本身是成功的，报告只影响页面上的统计）' -ForegroundColor Yellow
-                    }
+            $ReportScript = Join-Path $PSScriptRoot 'Build-ChunkReport.ps1'
+            if (Test-Path -LiteralPath $ReportScript) {
+                try {
+                    & $ReportScript -ProjectRoot $ProjectRoot -ArchiveDir $OutDir `
+                        -Platform $Platform -Target $PackTarget -TargetName $TargetName -Mode $Mode -PackLogPath $LogFile
+                }
+                catch {
+                    Write-Host "  [警告] 分包报告生成失败：$($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-Host '         （打包本身是成功的，报告只影响页面上的统计）' -ForegroundColor Yellow
                 }
             }
-        }
-        else {
-            Write-Host ''
-            Write-Host "[警告] 没找到产物目录：$PaksDir" -ForegroundColor Yellow
-            Write-Host '       检查 -archivedirectory 与平台目录名。' -ForegroundColor Yellow
         }
     }
 }

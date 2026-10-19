@@ -46,12 +46,17 @@ pakchunk0-Windows.utoc / .ucas ...
 
 扩展点 `FContentBrowserMenuExtender_SelectedPaths`，段名 `CrossingChunk`（「Chunk 分块」）。
 
+右侧资产视图里**选中资产的右键菜单**也有同一套入口（扩展点
+`FContentBrowserMenuExtender_SelectedAssets`，挂在「在文件夹视图中显示」那段的后面）：
+按「选中资产所在的目录」划块——单目录时和文件夹右键完全同一套菜单；
+跨了多个目录时走批量（整组目录划给一个 chunk，新建的名字取公共祖先的目录名）。
+
 菜单分三段：
 
 | 段 | 内容 |
 |---|---|
 | 状态行（只读） | `当前：Chunk 3 · 第三章-角色与主界面（本目录直接标记）`<br>`当前：Chunk 0 · 基础包（继承自 /Game/GameActor2D）`<br>`当前：未分类 —— 本次新增，会进新建的 Chunk 8` |
-| 指定为 Chunk ▸ | 列出所有现有 chunk（RadioButton，当前所属打勾）+ 最后一项 `新建 Chunk N · 「目录名」` |
+| 指定为 Chunk ▸ | 列出所有现有 chunk（RadioButton，当前所属打勾）+ 最后一项 `新建 Chunk N · 「目录名」`。<br>**有分类时**：每个分类一个二级子菜单（划过去展开，未分组垫底）；一个分类都没有 → 平铺（和从前一样） |
 | 取消本目录的标记 | 取消后重新跟随最近的上级目录；该目录是这个 chunk 的最后一个标记时，规则一并删掉 |
 
 状态行那三种文案是有意写死的：
@@ -77,28 +82,53 @@ pakchunk0-Windows.utoc / .ucas ...
 - 输出目录（`-ArchiveDir`）、地图摘要、玩家版本、基线版本（只读）、基线目录
 - 状态行：`报告：` / `产物：` / `基线：`
 - 选择地图（扫 `AssetRegistry` 里的 `World` 资产，带搜索框 + 重新扫描 + 全部不勾）
-- 规则列表：`号 | 名字（双击可改） | 目录数 | 文件数 | 体积 | 变化 | 解散`
+- 规则列表：`号 | 名字（双击可改） | 分类（可编辑） | 目录数 | 文件数 | 体积 | 变化 | 解散`，
+  有分类时按「分类 → ChunkId」分组显示（组间插只读标题行，未分组垫底）
 - 「运行设置（额外）」折叠区：Cook 进程数、基线位置
 
 **右栏**
 
-- 本次新增（未分类目录）清单 + 一键指派 + 定位
+- 本次变更（未分类资源）清单 + 重新扫描 + 一键指派 + 定位
 - 打包日志（实时，按行着色）
 
 ### 3. 规则列表
 
 - **双击改名**：提交后立刻写回 ini，右键菜单同步（`ChunkId` 不动——名字只影响显示，
   已经发出去的包不受影响）。
+- **分类列**：下拉选择——未分组 / 现有分类 / 「新建分类…」（弹出小输入框，回车即建）。
+  纯显示字段——面板列表按它分组排序、右键菜单按它开子菜单、「指派到」下拉带 `[分类]` 前缀，
+  **打包完全不读它**，ChunkId 一动不动。
 - **解散**：二次确认弹窗，删掉这条规则，它下面的目录回到未分类；确认框里明确写了「可以撤回」。
 - **撤销解散**：会话内保留一份被删的规则（`UndoRule`），点一下原样塞回去。
-- **文件数 / 体积 / 变化**：来自最近一次打包报告，`+新增 -删除 ~修改`（和上一次报告比）。
+- **文件数 / 体积 / 变化**：来自最近一次打包报告。体积自适应单位（B/KB/MB/GB，后缀带全）；
+  变化按 增（绿）/ 删（橙）/ 改（蓝）分块显示、只列非零项，全 0 明说「无变化」。
+  **「改」= cook 出来的字节数变了，或 `Content` 下那个源资产的哈希变了**（后者专抓"同字节数的修改"：
+  材质实例改标量、Blueprint 改默认值这种；`.umap`/`.ubulk`/字体那些没有大小可比的也一并覆盖）。
+  安卓的 pak 打进 APK/OBB，没有容器文件可量 —— 体积列显示「不统计」（文件数和变化照常有）。
+- **表格上方那行「变化基准」**：说清「增 / 删 / 改」是跟哪一份报告比出来的
+  （例：`变化基准：09-20 01:39 的报告（21 天前）`）。**打包失败不会刷新 `latest.json`**，
+  基准会静默停在更早那份 —— 隔了 3 天以上、或本会话里上次打包失败，这行就标黄提醒：
+  这时那一列是「自那以后的全部改动」，不是本次打包带来的。
 
-### 4. 本次新增（未分类）清单一键指派
+### 4. 本次变更（未分类资源）清单一键指派
 
-清单来自「上一次打包报告」的 `unclassified` 段，但**渲染时会拿当前规则再核一遍**：
-已经被某个分块覆盖的，标成 `[已归类] → Chunk N · 名字（下次打包生效）`（绿色）。
+清单是**实时扫出来的**，不来自打包报告：对比当前规则和 `AssetRegistry`，
+列出「自身和所有祖先都没被规则标记」的资源目录（标记是继承的——父目录被标记，
+子目录就算已归类，和右键菜单状态行的语义一致）。
 
-不直接删掉这一行是有意的——用户刚点完指派，得看得见「它去哪了」。
+> World Partition 关卡的 OFPA 目录（`/Game/__ExternalActors__`、`/Game/__ExternalObjects__`，
+> 每个 actor 一个 `.uasset`）**不列进来**：它们 cook 之后不落成独立文件，会被折进关卡的
+> `_Generated_` 流送单元、跟关卡本体进同一个 chunk，所以永远匹配不到规则 ——
+> 列出来只是催人做无用功，真加规则又是不命中的死规则（报告会报「一条文件都没命中」）。
+> 清单里还有别的"cook 期会被吃掉"的目录时，往 `SCrossingChunkPanel.cpp` 的
+> `GIgnoredUnclassPrefixes` 里加一条即可。
+
+按「顶层未覆盖目录」归组：新资源落在已标记目录的下面时精确显示那个新目录；
+把 chunk 全部拆散重新分配时，清单自动收敛成 `/Game` 的第一层目录列表——
+正好是逐个重新分配的操作粒度。指派完一刷新，行就消失（没有陈旧数据，也就
+不需要以前那套「已归类」对账显示）。右上角有「重新扫描」手动触发。
+
+> 这个语义和打包脚本兜底规则（`CC_NewContent`）是一致的：没被规则认领的文件进新 chunk。
 
 旁边还有一个「指派到」下拉，不用跳回内容浏览器右键。它会先做一次 `RefreshRules()`，
 **但刷新推迟到下一帧**（`FTSTicker` + `TWeakPtr`）：因为回调正跑在 combo 自己的回调里，
@@ -112,13 +142,34 @@ pakchunk0-Windows.utoc / .ucas ...
 |---|---|---|---|
 | Windows | `Win64` | `Client` | PC 客户端 |
 | 安卓 | `Android` | `Client` | 安卓客户端 |
-| 服务器 | `Win64` | `Server` | **出散件，不分包** |
+| 服务器 | `Win64` | `Server` | **出散件、走 git，不分包** |
 
 | 模式 | 值 | 说明 |
 |---|---|---|
 | 常规补丁更新（新资源单独成包） | `Patch` | 基于已有基线算差异 |
 | 版本更新（完整包 + 建基线） | `Base` | 一条基线约 1.5 GB |
 | 快速验证（只测试：不产发布包） | `Quick` | 报告单独一份 |
+
+**《常规补丁》点「开始打包」时会先自动登记一批「版本补丁N」。**
+脚本对未分类文件只能无脑兜底到一个号（规则里 `max(ChunkId)+1`，规则不变那个号就永远不变），
+于是每批新资源都挤进同一块、那块越滚越大，每次补丁玩家都要重下整块。所以《常规补丁》
+在起进程之前，会把右栏「本次变更」里那些目录**登记成一条新规则**「版本补丁N」
+（N 递增，一次读写、原子落盘），当场写进 `DefaultCrossingChunk.ini`：
+这批拿到自己的号，下一批再拿下一个号，补丁只带新块，右栏也跟着清空。
+登记的是**精确目录**（如 `/Game/AssetMaterial/Sound/UI_Effect`），不是右栏显示的锚点
+（`/Game/AssetMaterial`）—— 锚点会把整棵树永久认领，以后往老目录里塞新文件就再也不会被认成新的一批。
+另外新号会避开"上一次打包兜底块用过的号"（那个号没写进规则，但已经发给玩家了）。
+**必须在打包前做**：脚本是 cook 之前读规则文件的；而这一切只能在面板侧做 ——
+脚本那时根本不知道哪些文件是"这次新来的"。
+
+**《版本更新》会拦下没清干净的补丁批次。**
+《版本更新》是做正式划分的时候：只要还有「版本补丁N」，**「开始打包」按钮直接灰掉**
+（悬停能看到原因：还有几个批次、去哪分），右栏同时切成「待正式划分」清单 ——
+一个批次一个标题（`版本补丁1 · chunk 40（49 个目录）`），它名下的目录各一行，
+行样式和「本次变更」完全一样，用「指派到」把每个目录分进正式分块；
+一个批次的目录被搬空，它自己就消失。全部分完，右栏回到「本次变更」，打包才放行。
+判据是规则名以「版本补丁」开头（不往规则格式里加字段），所以**把批次改名成正式分块名也算处理**。
+（《常规补丁》下右栏不切 —— 那时要显示的是未分类清单，那才是这次要登记成新批次的料。）
 
 - 选「服务器」时，模式下拉被禁掉、文案变成「服务器散件（不分包，走 git）」，
   命令里强制传 `Quick`——散件没有「版本/补丁」这一说，禁掉比报错友好。
@@ -130,10 +181,11 @@ pakchunk0-Windows.utoc / .ucas ...
 
 ### 6. 两条前置检查（把「跑到一半才失败」提前到点击那一刻）
 
-1. **目标 Shipping 二进制不存在**
-   打包脚本会给 UAT 加 `-build`，而编辑器开着（Live Coding 激活）时 UE 不允许从外部编译，
-   UBT 会抛 `Unable to build while Live Coding is active`。
-   → 不硬闯，也不 return：把提示写进日志，让脚本自己去**单独编译那个目标**
+1. **目标 Shipping 二进制不存在（或已过期）**
+   脚本会先看三件事：收据不存在、源码比 Shipping 二进制新、收据里记的插件路径已失效。
+   命中任意一条就先**单独编译那个目标**，再让 UAT 带 `-nocompile` 跑 ——
+   不把编译交给 UAT 的 `-build`，因为那一轮会顺带编编辑器目标，撞上 Live Coding 的互斥体。
+   → 面板不硬闯、也不 return：把提示写进日志，具体编译交给脚本
    （单独编译只针对这个目标，不会被 Live Coding 挡住，所以编辑器不用关）。
 
 2. **《常规补丁》但找不到基线**
@@ -201,7 +253,7 @@ Saved\Shaders        —— shader 缓存
 
 1. 加了资源 → 在内容浏览器右键它所在的目录 → 「指定为 Chunk」；
    或者**什么都不做**，让它进新 chunk（未分类 = 本次新增，不会污染基础包）。
-2. 打开《二游打包》页 → 确认「本次新增」清单和预期一致。
+2. 打开《二游打包》页 → 确认「本次变更（未分类资源）」清单和预期一致。
 3. 选目标、选模式、勾地图 → 开始打包。
 4. 打完看报告：每个 chunk 多少文件、多大体积、比上次变了多少。
 
@@ -215,14 +267,21 @@ Saved\Shaders        —— shader 缓存
 
 默认路径：`<工程>\Config\DefaultCrossingChunk.ini`
 
+**文件不存在时，插件会自动生成一份空规则集**（只有说明、段头和 `+GlobalExcludeFolders=`），
+所以新工程第一次打开面板 / 第一次右键文件夹就能直接开始分配，不用手工造文件。
+空规则集是合法状态：打包时全部内容按脚本兜底进 chunk 0。
+
 段名：`/Script/CrossingChunk.CrossingChunkRuleSet`
 
 ```ini
 [/Script/CrossingChunk.CrossingChunkRuleSet]
-+Chunks=(ChunkName="基础包",ChunkId=0,Folders=((Path="/Game/BaseC"),(Path="/Game/MapS")),Priority=0,bIncludeInInstallPackage=True,ForceExcludeFolders=,Comment="随安装包发布。")
++Chunks=(ChunkName="基础包",Category="核心",ChunkId=0,Folders=((Path="/Game/BaseC"),(Path="/Game/MapS")),Priority=0,bIncludeInInstallPackage=True,ForceExcludeFolders=,Comment="随安装包发布。")
 +Chunks=(ChunkName="登录资源",ChunkId=4,Folders=((Path="/Game/AssetMaterial/ImageS/Login_Image"),(Path="/Game/UIWidget/LoginUI")),Priority=0,bIncludeInInstallPackage=False,ForceExcludeFolders=,Comment="登录相关图片与UI。")
 +GlobalExcludeFolders=
 ```
+
+`Category` 是可选的显示用字段（没有它 = 未分组），打包脚本按字段名正则抓值、
+会自动忽略它；只想分类、不想动别的，在面板的分类列里从下拉选一个（或「新建分类…」）。
 
 写回时的行为：**保留文件里其它段和注释，只替换 `+Chunks=` 那些行**，
 并在规则数变多时把新行插在 `+GlobalExcludeFolders=` 之前。新建 chunk 时
@@ -286,11 +345,12 @@ CrossingChunkEditor/
 
 ```
 Saved\PackLogs\pack-status.json                      状态行（-Status 产出）
-Saved\PackLogs\ChunkReports\<Win64-Client|Android-Client|Win64-Server>[-Quick]\latest.json
+Saved\PackLogs\ChunkReports\<Win64-Client|Android-Client>[-Quick]\latest.json
 ```
 
 报告目录名 = `<Platform>-<Target>`；**《快速验证》的报告带 `-Quick` 后缀单独存一份**——
 它不打 pak，体积列本来就是 0，不能冲掉正式报告里的体积/变化。
+服务器目标（散件走 git、不分包）**不产报告**，页面那两格对它显示「不适用」。
 
 ### 脚本怎么找到工程
 
@@ -306,6 +366,10 @@ Saved\PackLogs\ChunkReports\<Win64-Client|Android-Client|Win64-Server>[-Quick]\l
 下时向上找不到 `.uproject`，靠面板传的这个值也能跑。
 （脚本之间互相调用用的是 `$PSScriptRoot`，所以三份脚本必须待在同一个目录里。）
 
+**工程名和 target 名也不再写死**：脚本从工程根下的 `*.uproject` 取工程名，
+再读 `Source\*.Target.cs` 的 `Type = TargetType.Game / Server` 推客户端 / 服务器 target。
+工程根下有多个 `.uproject` 时，优先用和目录同名的那个。
+
 ### 换机器要改的默认值
 
 脚本里有几处**与本机环境绑定**的默认值，换机器要改（都在文件头的 `param` 里）：
@@ -314,7 +378,8 @@ Saved\PackLogs\ChunkReports\<Win64-Client|Android-Client|Win64-Server>[-Quick]\l
 |---|---|---|
 | `D:\UnrealEngine-5.8.2` | 三份脚本的 `-EngineRoot` / `-UatLogDir` | 引擎根目录。源码版才需要；Launcher 版改成对应安装路径 |
 | `F:\DaBaoV\Crossingvoid` | `Pack-CrossingVoid.ps1` 的 `-ArchiveDir` / `-ReleaseRoot` | 默认输出目录与基线目录（面板上的「输出目录」「基线位置」会覆盖它） |
-| `CrossingVoid` / `CrossingVoidServer` | 各处的工程名与 target 名 | 换项目就得跟着改 |
+
+工程名 / target 名**不用改**：从 `*.uproject` 和 `Source\*.Target.cs` 自动推导。
 
 ---
 
@@ -352,21 +417,49 @@ Saved\PackLogs\ChunkReports\<Win64-Client|Android-Client|Win64-Server>[-Quick]\l
 
 **UI 文案里不用 `▾` 这类符号**——编辑器默认字体里会渲染成方框。用文字。
 
+**分类下拉里的「新建分类…」不能拿 `nullptr` 当哨兵。**
+那个列表是 `SListView<TSharedPtr<FString>>`，而 SListView 生成行时会**跳过无效项**
+（引擎 `SListView.h`：`if (!IsPtrValid(CurItem)) continue;`）—— nullptr 那一项根本不会被画出来，
+下拉里只剩「未分组」加一根滚动条，表现就是「新建分类永远点不到」（2026-10-11 踩过）。
+现在用 `GNewCategoryToken` 这个内容特殊的真字符串当哨兵。
+同一个下拉还得开 `ReselectionTriggersOnSelectionChanged(true)`：SComboBox 默认「重选同一项不回调」，
+而选中哨兵之后 `SelectedItem` 就记成它了，不打开这个开关第二次点也没反应。
+另外 `PushMenu` 把弹层推上去之后要**自己给输入框设键盘焦点**：Slate 只把焦点给菜单内容本身
+（`MenuStack.cpp` 的 `PrePush`），不设的话敲字和回车都进不来。
+
 **平台设置那个 `FString::Printf` 先落局部变量再拼**，不要写成
 `FString::Printf(TEXT("%s"), *FString::Printf(...))`——`*` 取的是临时对象，会踩悬垂指针。
 
 **规则文件自己读写 UTF-8。**
+
+**PowerShell 脚本里别把长条件拆行。** 括号里换行时，只有**行尾停在运算符上**才会续行；
+行尾已经是个完整表达式、下一行以 `-and` 开头，会被当成新语句直接报错（`Build-ChunkReport.ps1`
+里踩过，实测确认）。那几个判断现在都是一行一个条件。
+
+**报告里的「改」用"cook 体积 + 源资产哈希"两条判据。** 只看 cook 体积抓不到同字节数的修改
+（材质实例改标量、Blueprint 改默认值），所以 3.5 节会给每个文件算一次 `Content` 下源资产的
+MD5 前 16 位（约 1.1 万个文件 / 4.6 GB，实测 20–25 秒；源文件不存在或读不了就记空串、退回只比大小）。
+用源文件而不是 cook 产物：开了 ZenStore 之后 cooked 的 uasset 不落盘。
+改版后的**第一趟打包是过渡期**（上一次报告里没有哈希列），那一趟用"源文件时间比上次报告晚"兜底
+并在控制台里写明；从第二趟起只看内容哈希，只有真的改了内容才算。
 不用 `FFileHelper::LoadFileToStringArray`：那份实现在**没有 BOM** 时会按 ANSI 处理，
 中文分块名会直接毁掉。
 
 ---
 
-## 已知问题 / 待办
+## 修复记录
 
-**① 安卓平台生不出分包报告。**
-根因是 `Pack-CrossingVoid.ps1` 的收尾逻辑挂在 `if (Test-Path $PaksDir)`，而安卓的 pak
-打进 APK/OBB，没有 `Content\Paks` 目录，掉进 else 就跳过了——体积统计和清单归档目前会被跳过。
+**① 安卓平台生不出分包报告（2026-10-11 已修）。**
+原来 `Pack-CrossingVoid.ps1` 的收尾（归档 staged 清单 + 生成报告）整块挂在
+`if (Test-Path $PaksDir)` 里，而安卓的 pak 打进 APK/OBB、没有 `Content\Paks`，于是整块被跳过——
+表现就是安卓平台永远显示「报告：还没有（还没打包过）」（其实打过，也成功了）。
+现在两件事已解耦：**体积统计**仍然只对落在 `Content\Paks` 的形态做（报告里
+`containerStats=false`，页面体积列显示「不统计」），**清单归档和分包报告**两个平台都做。
 详见 `Docs/2026-09-20-待办-安卓分包报告.md`。
+
+---
+
+## 已知问题 / 限制
 
 **② 验证覆盖度。**
 打包链路完整验证过的是 **Windows + Client**。安卓与专用服务器（Server 散件）在脚本层面支持，
@@ -374,12 +467,9 @@ Saved\PackLogs\ChunkReports\<Win64-Client|Android-Client|Win64-Server>[-Quick]\l
 
 **③ 「撤销解散」只在当前编辑器会话内有效。** 关掉编辑器就没了（要更久的可逆性走 git）。
 
-**④ 「本次新增」清单来自上一次打包报告。** 刚打开、还没打过包时它是空的——
-面板会明说「还没有打包报告 —— 先在「平台」菜单里跑一次打包」。
-
-**⑤ 未在界面上暴露的字段。** `Priority` 和 `ForceExcludeFolders` 会原样保留在规则里，
-但不提供 UI（语义未验证，见「设计原则」最后一条的延伸：
-界面上每多一个开关，就多一个「它到底管不管用」的问题）。
+**④ 未在界面上暴露的字段。** `ForceExcludeFolders` 由 `Build-PakFileRules.ps1` 翻译成
+`-Files=` 排除项（生效，只是没做 UI）；`Priority` 和 `Comment` 只保留、不参与打包；
+`bIncludeInInstallPackage` 由插件写入，但打包脚本目前不读它（只有 0 号包默认 `True`）。
 
 ---
 
