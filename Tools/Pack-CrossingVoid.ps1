@@ -45,6 +45,12 @@
     Win64 / Android
     注意：Server 目标只在 Win64 上有意义；Android 不支持专用服务器。
 
+.PARAMETER Configuration
+    Shipping（正式包，默认）/ Development（测试包）。
+    Development 下 PrintString、日志、控制台可用；只支持 Win64。
+    产物自动落到 <ArchiveDir>\Development，基线和报告也独立，
+    所以不会覆盖正式 Shipping 的包/基线；第一次用 Patch 前先用《版本更新》建 Development 基线。
+
 .PARAMETER ReleaseVersion
     Base 模式必填（如 1.0）。基线会落在 <ReleaseRoot>\<版本>\<平台>\。
     Patch 模式也必填 —— 必须指明「基于哪个基线版本」算差异，引擎强制要求
@@ -54,9 +60,9 @@
     产物输出根目录。默认 F:\DaBaoV\Crossingvoid
 
 .PARAMETER ReleaseRoot
-    基线（Releases）根目录。默认 F:\DaBaoV\Crossingvoid\Release
+    基线（Releases）根目录。留空 = <ArchiveDir>\Release（推荐，基线永远跟着产物目录）。
     UAT 的"建基线"(-createreleaseversionroot) 和"算补丁"(-basedonreleaseversionroot) 都用它，
-    所以读和写必须是同一个值 —— 插件「运行设置（额外）→ 基线位置」每次都会把界面上的值传进来。
+    所以读和写必须是同一个值 —— 插件「运行设置（额外）→ 基线位置」会自动派生并只读显示。
 
 .PARAMETER Cook
     强制全量重新 cook。第一次打包或改了大量资产时用。
@@ -66,6 +72,14 @@
 
 .PARAMETER ForceBuild
     强制本次编译 C++（即使 Shipping 目标已存在）。
+
+.PARAMETER CodeOnly
+    纯代码补丁：只编译 Shipping，把变化的运行时二进制镜像到归档；不 cook / stage / pak。
+    只适用于“只改 C++ 逻辑，没改资产 / 反射布局 / Shader / Config”的情况。
+
+.PARAMETER ForceCodePatch
+    变化扫描发现 Content / Config / Shader / 构建配置变化时，仍然强制继续（危险）。
+    只在你确认这些变化不需要 cook 时才用。
 
 .EXAMPLE
     # 第一次打客户端基线包（Windows）
@@ -98,6 +112,11 @@ param(
     [ValidateSet('Win64', 'Android')]
     [string]$Platform = 'Win64',
 
+    # 打包配置：Shipping 正式包 / Development 测试包（PrintString、日志、控制台可见）。
+    # Development 只支持 Win64；产物自动落到 <ArchiveDir>\Development，基线/报告也独立。
+    [ValidateSet('Shipping', 'Development')]
+    [string]$Configuration = 'Shipping',
+
     [string]$ReleaseVersion = '',
 
     # 给玩家看的版本号（写进 Config\DefaultEngine.ini 的
@@ -107,9 +126,9 @@ param(
 
     [string]$ArchiveDir = 'F:\DaBaoV\Crossingvoid',
 
-    # 基线（Releases）根目录；插件「运行设置（额外）→ 基线位置」写的就是它。
+    # 基线（Releases）根目录；留空 = <ArchiveDir>\Release。
     # 建基线和算补丁都用这一个值，别只改一处。
-    [string]$ReleaseRoot = 'F:\DaBaoV\Crossingvoid\Release',
+    [string]$ReleaseRoot = '',
 
     # 本次要 cook 的地图（逗号分隔，如 "/Game/MapS/LoginMap,/Game/MapS/MainMap"）。
     # 留空 = 用 DefaultGame.ini 里的 +MapsToCook 那四条。
@@ -132,7 +151,7 @@ param(
     # 保留 pdb（符号文件）。默认【从源头就不生成】+ 归档目录里也兜底剔除。
     # Windows 在 Shipping 下默认会产 pdb（客户端 1.6 GB / 服务器 1.5 GB），
     # 要关掉必须 -NoDebugInfo 和 -NoLinkerDebugInfo 一起给，缺一个都不行。
-    # 详见 Tools\打包说明.md 的「pdb 与符号文件」一节。
+    # 详见 Docs\打包说明.md 的「pdb 与符号文件」一节。
     [switch]$KeepSymbols,
 
     # 只清"能再生"的缓存，清完就退出（不打包）。页面上的《清除缓存》按钮走的就是这条。
@@ -144,6 +163,13 @@ param(
 
     # 只读查询：报告 / 产物 / 基线三件事，给页面上的状态行用。查完就退出。
     [switch]$Status,
+
+    # 纯代码补丁：只编译 Shipping + 镜像变化的运行时二进制，不 cook / stage / pak。
+    # 只适用于“只改 C++ 逻辑，没改资产/反射布局/Shader/Config”的情况。
+    [switch]$CodeOnly,
+
+    # 变化扫描发现 Content / Config / Shader / 构建配置变化时，仍然强制继续（危险）。
+    [switch]$ForceCodePatch,
 
     # 多进程 cook（MPCook，UE5.3+）：把 cook 拆成「1 个 director + (N-1) 个 cook worker」好几个进程并行跑。
     # 引擎里的开关就是 -CookProcessCount=N —— 出处是引擎自带注释（Engine\Config\BaseEditor.ini 的 [CookSettings]）：
@@ -177,6 +203,7 @@ trap {
             Write-Host ("[配置] 还原 DefaultGame.ini 失败：{0}" -f $_.Exception.Message) -ForegroundColor Red
         }
     }
+    Write-Host ("[错误] {0}" -f $_.Exception.Message) -ForegroundColor Red
     throw
 }
 
@@ -257,7 +284,23 @@ $ServerTargetName = if ($PreferredServer) { Get-TargetBaseName $PreferredServer 
 $EngineRoot  = 'D:\UnrealEngine-5.8.2'
 $RunUAT      = Join-Path $EngineRoot 'Engine\Build\BatchFiles\RunUAT.bat'
 
-# 基线（Releases）根目录来自 -ReleaseRoot 参数（默认 F:\DaBaoV\Crossingvoid\Release，一条基线约 1.5 GB）。
+# 基线（Releases）根目录：留空就跟产物目录走。
+# 这样换工程/换输出目录时，基线不会还留在上一个工程的路径下。
+if ([string]::IsNullOrWhiteSpace($ArchiveDir)) {
+    $ArchiveDir = 'F:\DaBaoV\Crossingvoid'
+}
+if ($Configuration -eq 'Development' -and $Platform -ne 'Win64') {
+    throw '[配置] Development 只支持 Win64；Android 的测试包请用 Shipping。'
+}
+# 产物目录：Shipping 和 Development 【共用同一个】，不做任何按配置的子目录 ——
+# 发布/上传脚本认死了这条路径，产物一挪它就传错东西（2026-10-21 定的）。
+# 但基线反过来必须分开：混在一起时，Development 的《版本更新》会覆盖正式基线
+# （同一个 <ReleaseRoot>\<版本>\<平台>），之后正式线算补丁就拿了开发版当基准。
+if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+    $ReleaseSub = if ($Configuration -eq 'Development') { 'Release-Development' } else { 'Release' }
+    $ReleaseRoot = Join-Path $ArchiveDir $ReleaseSub
+}
+
 # UAT 的"写"(-createreleaseversionroot) 和"读"(-basedonreleaseversionroot) 必须同根 ——
 # 插件每次打包/查状态都会把「运行设置（额外）→ 基线位置」里的值原样传进来，
 # 所以两边永远是同一个值，不会出现"写 D 读 C 找不到基线"。
@@ -270,6 +313,63 @@ function Assert-Path {
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "[检查失败] 找不到${What}：`n  $Path"
     }
+}
+
+# 往 ini 的某个段里写一条 key=value：有就改、没有就插在该段第一行之后；段不存在就补一个。
+# 返回 $true 表示内容真的变了（没变就不落盘，避免把 mtime 搅动、让 UBT 以为配置改了）。
+# 落盘时保留原文件风格（BOM / 无 BOM 各自保持）—— 工程里的 ini 是 CRLF + BOM，
+# 写成别的样子 UBT 会把 makefile 判成"配置已修改"，又多一次全量重编。
+function Set-IniKey {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Section,
+        [Parameter(Mandatory)][string]$Key,
+        [AllowEmptyString()][string]$Value
+    )
+
+    # BOM 必须自己看字节：[System.IO.File]::ReadAllText 会自动把 BOM 吃掉，
+    # 靠 $Raw[0] 判断永远是 false —— 那样写回时就把 BOM 抹了（2026-10-27 单测踩到）。
+    $Bytes = [System.IO.File]::ReadAllBytes($Path)
+    $HasBom = ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF)
+    $Raw = [System.Text.Encoding]::UTF8.GetString($Bytes)
+    if ($HasBom) { $Raw = $Raw.Substring(1) }
+
+    $Lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($L in ($Raw -split "`r?`n")) { $Lines.Add($L) }
+
+    $NewLine  = "$Key=$Value"
+    $KeyRegex = '^\s*' + [regex]::Escape($Key) + '\s*='
+    $SectionIdx = -1
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i].Trim() -eq $Section) { $SectionIdx = $i; break }
+    }
+
+    if ($SectionIdx -lt 0) {
+        # 段不存在：补一个空行 + 段头 + 这条 key
+        while ($Lines.Count -gt 0 -and $Lines[$Lines.Count - 1].Trim() -eq '') { $Lines.RemoveAt($Lines.Count - 1) }
+        if ($Lines.Count -gt 0) { $Lines.Add('') }
+        $Lines.Add($Section)
+        $Lines.Add($NewLine)
+    }
+    else {
+        $Done = $false
+        for ($i = $SectionIdx + 1; $i -lt $Lines.Count; $i++) {
+            $t = $Lines[$i].Trim()
+            if ($t.StartsWith('[')) { break }            # 到下一段了，说明本段没有这个 key
+            if ($t -match $KeyRegex) {
+                if ($t -eq $NewLine) { return $false }   # 已经是目标值，不落盘
+                $Lines[$i] = $NewLine
+                $Done = $true
+                break
+            }
+        }
+        if (-not $Done) { $Lines.Insert($SectionIdx + 1, $NewLine) }
+    }
+
+    $Text = ($Lines -join "`r`n")
+    if (-not $Text.EndsWith("`r`n")) { $Text += "`r`n" }
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($HasBom)))
+    return $true
 }
 
 # ============================ 清归档目录 ============================
@@ -470,12 +570,508 @@ function Show-PlatformSettings {
 
 Write-Host ''
 Write-Host '========================================' -ForegroundColor Cyan
-Write-Host ' 零境交错 / CrossingVoid  打包' -ForegroundColor Cyan
+Write-Host " $ProjectName  打包" -ForegroundColor Cyan
 Write-Host '========================================' -ForegroundColor Cyan
 Write-Host ""
 
 Assert-Path $ProjectFile '工程文件 .uproject'
 Assert-Path $RunUAT      'RunUAT.bat（检查 EngineRoot 是否正确）'
+
+# ============================ 纯代码补丁模式 ============================
+# 只编译 Shipping + 把变化的运行时二进制镜像到归档；不 cook / stage / pak。
+# 设计文档：Docs\2026-10-20-纯代码补丁模式设计.md
+if ($CodeOnly) {
+    if ($ClearCache -or $Status) {
+        throw '[代码补丁] -CodeOnly 不能和 -ClearCache / -Status 同时使用。'
+    }
+    if ($Target -eq 'Both') {
+        throw '[代码补丁] -Target Both 不支持；客户端和服务器请分两次。'
+    }
+    if ($Platform -ne 'Win64') {
+        throw '[代码补丁] 目前只支持 Win64；Android 的代码在 APK 的 .so 里，需要重打 APK。'
+    }
+    if ($Configuration -ne 'Shipping') {
+        throw '[代码补丁] 只支持 Shipping；Development 测试包请用《开始打包》/《快速验证》。'
+    }
+
+    # ---- 工具函数 ----
+    function Get-CodePatchCutoff {
+        param(
+            [string]$Root,
+            [string]$Platform,
+            [string]$Target,
+            [string]$ArchiveDir,
+            [string]$ArchivePlatformDir
+        )
+        $reportPath = Join-Path $Root "Saved\PackLogs\ChunkReports\$Platform-$Target\latest.json"
+        if (Test-Path -LiteralPath $reportPath) {
+            try {
+                $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if (-not [string]::IsNullOrWhiteSpace($report.generatedAt)) {
+                    return [datetime]::Parse($report.generatedAt)
+                }
+            }
+            catch { }
+        }
+        $manifestPath = Join-Path $ArchiveDir "$ArchivePlatformDir\Manifest_UFSFiles_$Platform.txt"
+        if (Test-Path -LiteralPath $manifestPath) {
+            return (Get-Item -LiteralPath $manifestPath).LastWriteTime
+        }
+        return $null
+    }
+
+    function Get-CodePatchChangeSet {
+        param([string]$Root, [datetime]$Cutoff)
+
+        $result = [ordered]@{
+            Code        = [System.Collections.Generic.List[string]]::new()
+            Header      = [System.Collections.Generic.List[string]]::new()
+            BuildConfig = [System.Collections.Generic.List[string]]::new()
+            Content     = [System.Collections.Generic.List[string]]::new()
+            Config      = [System.Collections.Generic.List[string]]::new()
+            Shader      = [System.Collections.Generic.List[string]]::new()
+        }
+
+        $scanRoots = @(
+            (Join-Path $Root 'Source'),
+            (Join-Path $Root 'Plugins'),
+            (Join-Path $Root 'Content'),
+            (Join-Path $Root 'Config'),
+            (Join-Path $Root 'Shaders')
+        )
+        foreach ($scanRoot in $scanRoots) {
+            if (-not (Test-Path -LiteralPath $scanRoot)) { continue }
+            Get-ChildItem -LiteralPath $scanRoot -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+                $path = $_.FullName
+                if ($path -match '\\Intermediate\\|\\Binaries\\|\\Saved\\|\\DerivedDataCache\\|\\.git\\|\\.vs\\|\\.idea\\') { return }
+                if ($_.Name -ieq 'DefaultPakFileRules.ini') { return }   # 打包脚本每次自动生成，不算人工配置变更
+                if ($_.LastWriteTime -le $Cutoff) { return }
+
+                $ext = $_.Extension.ToLowerInvariant()
+                if ($ext -eq '.uproject' -or $ext -eq '.uplugin' -or $ext -eq '.cs') {
+                    $result.BuildConfig.Add($path)
+                }
+                elseif ($path -match '\\Content\\') {
+                    $result.Content.Add($path)
+                }
+                elseif ($path -match '\\Config\\' -and $ext -eq '.ini') {
+                    $result.Config.Add($path)
+                }
+                elseif ($ext -eq '.usf' -or $ext -eq '.ush') {
+                    $result.Shader.Add($path)
+                }
+                elseif ($ext -eq '.cpp') {
+                    $result.Code.Add($path)
+                }
+                elseif ($ext -eq '.h') {
+                    $result.Header.Add($path)
+                }
+            }
+        }
+
+        # 根目录的 .uproject 不在 scanRoots 里
+        Get-ChildItem -LiteralPath $Root -Filter '*.uproject' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.LastWriteTime -gt $Cutoff) {
+                $result.BuildConfig.Add($_.FullName)
+            }
+        }
+
+        return $result
+    }
+
+    function Show-CodePatchChanges {
+        param($Changes, [string]$Root)
+        $total = 0
+        $categories = @(
+            @{ Name = '代码';     Items = $Changes.Code },
+            @{ Name = '头文件';   Items = $Changes.Header },
+            @{ Name = '构建配置'; Items = $Changes.BuildConfig },
+            @{ Name = '内容';     Items = $Changes.Content },
+            @{ Name = '配置';     Items = $Changes.Config },
+            @{ Name = 'Shader';   Items = $Changes.Shader }
+        )
+        foreach ($category in $categories) {
+            $items = @($category.Items)
+            if ($items.Count -eq 0) { continue }
+            $total += $items.Count
+            Write-Host ("  {0,-8} {1}" -f $category.Name, $items.Count) -ForegroundColor Yellow
+            $items | Select-Object -First 5 | ForEach-Object {
+                $fullPath = if ($_ -is [System.IO.FileInfo]) { $_.FullName } else { [string]$_ }
+                $rel = $fullPath.Substring($Root.Length).TrimStart('\')
+                Write-Host ("      {0}" -f $rel) -ForegroundColor DarkGray
+            }
+            if ($items.Count -gt 5) {
+                Write-Host ("      ...（还有 {0} 个）" -f ($items.Count - 5)) -ForegroundColor DarkGray
+            }
+        }
+        if ($total -eq 0) {
+            Write-Host '  （基准之后没有文件变化）' -ForegroundColor DarkGray
+        }
+    }
+
+    function Get-ModuleDllNames {
+        param([string]$ManifestPath)
+        $names = [System.Collections.Generic.List[string]]::new()
+        try {
+            $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $manifest.Modules) {
+                foreach ($prop in $manifest.Modules.PSObject.Properties) {
+                    if ($prop.Value) { $names.Add([string]$prop.Value) }
+                }
+            }
+        }
+        catch { }
+        return $names
+    }
+
+    function Get-ManifestBuildId {
+        param([string]$ManifestPath)
+        try {
+            $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($manifest.BuildId) { return [string]$manifest.BuildId }
+        }
+        catch { }
+        return ''
+    }
+
+    function Copy-CodePatchFile {
+        param(
+            [string]$SourcePath,
+            [string]$DestPath,
+            [string]$ArchiveRelativePath,
+            $ChangedFiles,
+            $ChangedPaths,
+            [bool]$DryRun
+        )
+        if (-not (Test-Path -LiteralPath $SourcePath)) { return }
+        if ($ChangedPaths.ContainsKey($ArchiveRelativePath)) { return }
+
+        $sourceItem = Get-Item -LiteralPath $SourcePath
+        $sourceHash = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if (Test-Path -LiteralPath $DestPath) {
+            $destHash = (Get-FileHash -LiteralPath $DestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($sourceHash -eq $destHash) { return }
+        }
+
+        $ChangedPaths[$ArchiveRelativePath] = $true
+        $ChangedFiles.Add([pscustomobject]@{
+            path      = $ArchiveRelativePath.Replace('\', '/')
+            sizeBytes = $sourceItem.Length
+            sha256    = $sourceHash
+            action    = 'copy'
+        })
+
+        if ($DryRun) { return }
+
+        $destDir = Split-Path -Parent $DestPath
+        if (-not (Test-Path -LiteralPath $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
+        $tmpPath = "$DestPath.new"
+        Copy-Item -LiteralPath $SourcePath -Destination $tmpPath -Force
+        Move-Item -LiteralPath $tmpPath -Destination $DestPath -Force
+
+        $newHash = (Get-FileHash -LiteralPath $DestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($newHash -ne $sourceHash) {
+            throw "[代码补丁] 复制后校验失败：$DestPath"
+        }
+    }
+
+    # ---- 参数与路径 ----
+    $TargetName = if ($Target -eq 'Server') { $ServerTargetName } else { $ClientTargetName }
+    $ArchivePlatformDir = if ($Target -eq 'Server') { 'WindowsServer' } else { 'Windows' }
+    $ArchiveRootFull = [System.IO.Path]::GetFullPath($ArchiveDir)
+    $ArchiveProjectDir = Join-Path $ArchiveRootFull "$ArchivePlatformDir\$ProjectName"
+    $ArchiveEngineDir = Join-Path $ArchiveRootFull "$ArchivePlatformDir\Engine"
+    $SourceProjectBin = Join-Path $ProjectRoot 'Binaries\Win64'
+    $SourceEngineBin = Join-Path $EngineRoot 'Engine\Binaries\Win64'
+    $DestProjectBin = Join-Path $ArchiveProjectDir 'Binaries\Win64'
+    $DestEngineBin = Join-Path $ArchiveEngineDir 'Binaries\Win64'
+
+    Write-Host ''
+    Write-Host '========================================' -ForegroundColor Cyan
+    Write-Host ' 纯代码补丁（只编译 Shipping）' -ForegroundColor Cyan
+    Write-Host '========================================' -ForegroundColor Cyan
+    Write-Host ("  工程     : {0}" -f $ProjectFile)
+    Write-Host ("  目标     : {0} / {1}" -f $Platform, $Target)
+    Write-Host ("  归档     : {0}" -f $ArchiveProjectDir)
+    Write-Host ''
+
+    # ---- 1. 变化扫描 ----
+    $Cutoff = Get-CodePatchCutoff -Root $ProjectRoot -Platform $Platform -Target $Target -ArchiveDir $ArchiveRootFull -ArchivePlatformDir $ArchivePlatformDir
+    if ($null -eq $Cutoff) {
+        throw '[代码补丁] 找不到完整打包基准（报告 latest.json / Manifest_UFSFiles）。先跑一次完整打包。'
+    }
+    Write-Host ("[变化扫描] 基准：{0:yyyy-MM-dd HH:mm}" -f $Cutoff) -ForegroundColor DarkGray
+    $Changes = Get-CodePatchChangeSet -Root $ProjectRoot -Cutoff $Cutoff
+    Show-CodePatchChanges -Changes $Changes -Root $ProjectRoot
+
+    # 引擎构建信息比基准新：可能是引擎升级/重编，cooked 数据未必兼容。
+    $engineVersionPath = Join-Path $EngineRoot 'Engine\Build\Build.version'
+    $engineVersionNewer = (Test-Path -LiteralPath $engineVersionPath) -and ((Get-Item -LiteralPath $engineVersionPath).LastWriteTime -gt $Cutoff)
+
+    $blocking = $Changes.Content.Count + $Changes.Config.Count + $Changes.Shader.Count + $Changes.BuildConfig.Count
+    if (($blocking -gt 0 -or $engineVersionNewer) -and -not $ForceCodePatch) {
+        Write-Host ''
+        Write-Host '[代码补丁] 检测到资产 / 配置 / Shader / 构建配置变化，或引擎 Build.version 比基准新，纯代码补丁不安全。' -ForegroundColor Red
+        if ($engineVersionNewer) {
+            Write-Host '           引擎 Build.version 比基准新：如果是引擎升级/重编，必须完整 cook。' -ForegroundColor Yellow
+        }
+        Write-Host '           请改用《常规补丁更新》/《版本更新》；确认不需要 cook 时才加 -ForceCodePatch。' -ForegroundColor Yellow
+        exit 2
+    }
+    if ($Changes.Header.Count -gt 0) {
+        Write-Host '[代码补丁] 警告：头文件有改动；若涉及 UPROPERTY/UFUNCTION/UCLASS 布局，必须完整 cook。' -ForegroundColor Yellow
+    }
+
+    # ---- 2. 归档 / 进程检查 ----
+    if (-not (Test-Path -LiteralPath $ArchiveProjectDir)) {
+        throw ("[代码补丁] 归档目录不存在：{0}`n  先跑一次完整打包（或把面板上的输出目录指对）。" -f $ArchiveProjectDir)
+    }
+    $processNames = @($TargetName, "$TargetName-Win64-Shipping")
+    if ($Target -ne 'Server') { $processNames += $ProjectName }
+    $running = @(Get-Process -Name $processNames -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        $runningNames = ($running | Select-Object -ExpandProperty ProcessName -Unique) -join ', '
+        throw ("[代码补丁] 游戏/服务器还在运行：{0}。先关掉再编。" -f $runningNames)
+    }
+
+    # ---- 3. 编译 Shipping ----
+    $BuildBat = Join-Path $EngineRoot 'Engine\Build\BatchFiles\Build.bat'
+    Assert-Path $BuildBat 'Build.bat'
+    $BuildArgs = @($TargetName, 'Win64', 'Shipping', "-Project=$ProjectFile", '-WaitMutex')
+    if (-not $KeepSymbols) { $BuildArgs += @('-NoDebugInfo', '-NoLinkerDebugInfo') }
+    $BuildCommandText = "& '$BuildBat' " + (($BuildArgs | ForEach-Object { "`"$_`"" }) -join ' ')
+    Write-Host '[编译] ' -NoNewline -ForegroundColor Yellow
+    Write-Host $BuildCommandText -ForegroundColor Green
+
+    $codePatchLog = ''
+    if ($DryRun) {
+        Write-Host '[DryRun] 不编译、不覆盖；下面只列出会镜像的二进制。' -ForegroundColor Yellow
+    }
+    else {
+        $logDir = Join-Path $ProjectRoot 'Saved\PackLogs'
+        if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        $codePatchLog = Join-Path $logDir ("code-patch-{0}-{1}-{2}.log" -f $Platform, $Target, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        Write-Host ("[日志] {0}" -f $codePatchLog) -ForegroundColor DarkGray
+        & $BuildBat @BuildArgs 2>&1 | Tee-Object -FilePath $codePatchLog
+        if ($LASTEXITCODE -ne 0) {
+            throw "[代码补丁] Shipping 编译失败，退出码 $LASTEXITCODE。归档没有改动。日志：$codePatchLog"
+        }
+        Write-Host '[编译] 完成' -ForegroundColor Green
+    }
+
+    # ---- 4. 判断 monolithic / modular，并检查归档布局 ----
+    if (-not (Test-Path -LiteralPath $SourceProjectBin)) {
+        throw ("[代码补丁] 找不到构建输出：{0}" -f $SourceProjectBin)
+    }
+    # 目标对应的 app 名：modular + Shared 时是 UnrealGame / UnrealServer；
+    # monolithic 时是 target 名（FantasyProject / FantasyProjectServer）。
+    $AppExeName = if ($Target -eq 'Server') { 'UnrealServer-Win64-Shipping.exe' } else { 'UnrealGame-Win64-Shipping.exe' }
+    $AppModuleName = $AppExeName -replace '\.exe$', '.modules'
+    $AppVersionName = $AppExeName -replace '\.exe$', '.version'
+
+    # 不能只扫 *Shipping*.modules：同一目录里可能同时有客户端和服务器的 manifest。
+    $SourceProjectModules = @()
+    foreach ($candidate in @(
+        (Join-Path $SourceProjectBin "$TargetName-Win64-Shipping.modules"),
+        (Join-Path $SourceProjectBin $AppModuleName)
+    )) {
+        if (Test-Path -LiteralPath $candidate) {
+            $SourceProjectModules = @(Get-Item -LiteralPath $candidate)
+            break
+        }
+    }
+    $engineModules = @()
+    foreach ($candidate in @(
+        (Join-Path $SourceEngineBin $AppModuleName),
+        (Join-Path $SourceEngineBin "$TargetName-Win64-Shipping.modules")
+    )) {
+        if (Test-Path -LiteralPath $candidate) {
+            $engineModules = @(Get-Item -LiteralPath $candidate)
+            break
+        }
+    }
+
+    $DestProjectModules = @()
+    foreach ($candidate in @(
+        (Join-Path $DestProjectBin "$TargetName-Win64-Shipping.modules"),
+        (Join-Path $DestProjectBin $AppModuleName)
+    )) {
+        if (Test-Path -LiteralPath $candidate) {
+            $DestProjectModules = @(Get-Item -LiteralPath $candidate)
+            break
+        }
+    }
+    $SourceIsModular = ($SourceProjectModules.Count -gt 0)
+    $ArchiveIsModular = ($DestProjectModules.Count -gt 0)
+    if ($SourceIsModular -ne $ArchiveIsModular) {
+        throw ("[代码补丁] 构建布局与归档布局不一致（source modular={0}, archive modular={1}）。先完整打包一次。" -f $SourceIsModular, $ArchiveIsModular)
+    }
+    Write-Host ("[布局] {0}" -f $(if ($SourceIsModular) { 'modular（游戏模块 DLL）' } else { 'monolithic（单个 Shipping exe）' })) -ForegroundColor DarkGray
+
+    # ---- 5. 镜像运行时二进制 ----
+    $ChangedFiles = [System.Collections.Generic.List[object]]::new()
+    $ChangedPaths = @{}
+    $copyArgs = @{
+        ChangedFiles = $ChangedFiles
+        ChangedPaths = $ChangedPaths
+        DryRun       = [bool]$DryRun
+    }
+
+    # 项目侧的 Shipping exe（modular 时可能是 UnrealGame-...，monolithic 时是 <Target>-...）
+    # 不能只写 *Shipping*.exe：同一目录里会同时有客户端和服务器两个 exe。
+    $ProjectExeCandidates = @(
+        (Join-Path $SourceProjectBin "$TargetName-Win64-Shipping.exe"),
+        (Join-Path $SourceProjectBin $AppExeName)
+    )
+    foreach ($exePath in $ProjectExeCandidates) {
+        if (Test-Path -LiteralPath $exePath) {
+            Copy-CodePatchFile -SourcePath $exePath -DestPath (Join-Path $DestProjectBin (Split-Path $exePath -Leaf)) -ArchiveRelativePath "$ProjectName/Binaries/Win64/$(Split-Path $exePath -Leaf)" @copyArgs
+            break
+        }
+    }
+
+    # modular：按项目 .modules 清单只拷游戏/插件模块 DLL
+    if ($SourceIsModular) {
+        foreach ($moduleManifest in $SourceProjectModules) {
+            Copy-CodePatchFile -SourcePath $moduleManifest.FullName -DestPath (Join-Path $DestProjectBin $moduleManifest.Name) -ArchiveRelativePath "$ProjectName/Binaries/Win64/$($moduleManifest.Name)" @copyArgs
+            foreach ($dllName in @(Get-ModuleDllNames -ManifestPath $moduleManifest.FullName)) {
+                $sourceDll = Join-Path $SourceProjectBin $dllName
+                if (Test-Path -LiteralPath $sourceDll) {
+                    Copy-CodePatchFile -SourcePath $sourceDll -DestPath (Join-Path $DestProjectBin $dllName) -ArchiveRelativePath "$ProjectName/Binaries/Win64/$dllName" @copyArgs
+                }
+            }
+        }
+    }
+
+    # 项目 Binaries 下的运行时 DLL（tbb / D3D12 / DML 等）；排除 editor DLL 和模块 DLL（模块由 manifest 精确控制）
+    Get-ChildItem -LiteralPath $SourceProjectBin -Recurse -File -Filter '*.dll' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike 'UnrealEditor-*' -and (-not $SourceIsModular -or ($_.Name -notlike 'UnrealGame-*' -and $_.Name -notlike 'UnrealServer-*')) } |
+        ForEach-Object {
+            $rel = $_.FullName.Substring($SourceProjectBin.Length).TrimStart('\')
+            Copy-CodePatchFile -SourcePath $_.FullName -DestPath (Join-Path $DestProjectBin $rel) -ArchiveRelativePath "$ProjectName/Binaries/Win64/$($rel.Replace('\', '/'))" @copyArgs
+        }
+
+    # 项目侧 .version（模块 manifest 已在上面按 target/app 精确拷贝）
+    foreach ($candidate in @(
+        (Join-Path $SourceProjectBin "$TargetName-Win64-Shipping.version"),
+        (Join-Path $SourceProjectBin $AppVersionName)
+    )) {
+        if (Test-Path -LiteralPath $candidate) {
+            Copy-CodePatchFile -SourcePath $candidate -DestPath (Join-Path $DestProjectBin (Split-Path $candidate -Leaf)) -ArchiveRelativePath "$ProjectName/Binaries/Win64/$(Split-Path $candidate -Leaf)" @copyArgs
+            break
+        }
+    }
+
+    # 引擎侧：只有 modular 才镜像；monolithic 的引擎代码已经在 exe 里
+    if ($SourceIsModular -and (Test-Path -LiteralPath $SourceEngineBin)) {
+        foreach ($moduleManifest in $engineModules) {
+            Copy-CodePatchFile -SourcePath $moduleManifest.FullName -DestPath (Join-Path $DestEngineBin $moduleManifest.Name) -ArchiveRelativePath "Engine/Binaries/Win64/$($moduleManifest.Name)" @copyArgs
+            foreach ($dllName in @(Get-ModuleDllNames -ManifestPath $moduleManifest.FullName)) {
+                $sourceDll = Join-Path $SourceEngineBin $dllName
+                if (Test-Path -LiteralPath $sourceDll) {
+                    Copy-CodePatchFile -SourcePath $sourceDll -DestPath (Join-Path $DestEngineBin $dllName) -ArchiveRelativePath "Engine/Binaries/Win64/$dllName" @copyArgs
+                }
+            }
+        }
+        # 引擎侧的 exe / .version（modular + Shared 时在 Engine/Binaries/Win64）
+        foreach ($candidate in @(
+            (Join-Path $SourceEngineBin $AppExeName),
+            (Join-Path $SourceEngineBin "$TargetName-Win64-Shipping.exe")
+        )) {
+            if (Test-Path -LiteralPath $candidate) {
+                Copy-CodePatchFile -SourcePath $candidate -DestPath (Join-Path $DestEngineBin (Split-Path $candidate -Leaf)) -ArchiveRelativePath "Engine/Binaries/Win64/$(Split-Path $candidate -Leaf)" @copyArgs
+                break
+            }
+        }
+        foreach ($candidate in @(
+            (Join-Path $SourceEngineBin $AppVersionName),
+            (Join-Path $SourceEngineBin "$TargetName-Win64-Shipping.version")
+        )) {
+            if (Test-Path -LiteralPath $candidate) {
+                Copy-CodePatchFile -SourcePath $candidate -DestPath (Join-Path $DestEngineBin (Split-Path $candidate -Leaf)) -ArchiveRelativePath "Engine/Binaries/Win64/$(Split-Path $candidate -Leaf)" @copyArgs
+                break
+            }
+        }
+    }
+
+    # ---- 6. 报告 ----
+    $buildId = ''
+    if ($SourceIsModular -and $SourceProjectModules.Count -gt 0) {
+        $buildId = Get-ManifestBuildId -ManifestPath $SourceProjectModules[0].FullName
+    }
+    elseif ($SourceIsModular -and $engineModules.Count -gt 0) {
+        $buildId = Get-ManifestBuildId -ManifestPath $engineModules[0].FullName
+    }
+    $engineChanged = @($ChangedFiles | Where-Object { $_.path -like 'Engine/*' }).Count -gt 0
+    $warnings = @()
+    if ($Changes.Header.Count -gt 0) {
+        $warnings += '头文件有改动；若涉及 UPROPERTY/UFUNCTION/UCLASS 布局，必须完整 cook'
+    }
+    if ($engineVersionNewer) {
+        $warnings += '引擎 Build.version 比基准新；如果是引擎升级/重编，必须完整 cook'
+    }
+
+    $reportDir = Join-Path $ProjectRoot 'Saved\PackLogs\CodePatch'
+    if (-not (Test-Path -LiteralPath $reportDir)) {
+        New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+    }
+    $reportPath = Join-Path $reportDir 'last-code-patch.json'
+    $report = [ordered]@{
+        schemaVersion = 1
+        generatedAt   = (Get-Date -Format 'yyyy-MM-ddTHH:mm:sszzz')
+        project       = $ProjectName
+        platform      = $Platform
+        target        = $Target
+        layout        = $(if ($SourceIsModular) { 'modular' } else { 'monolithic' })
+        buildId       = $buildId
+        engineChanged = $engineChanged
+        engineVersionNewer = $engineVersionNewer
+        buildLog      = $codePatchLog
+        archiveRoot   = $ArchiveRootFull
+        files         = @($ChangedFiles)
+        changedSinceLastFullPack = [ordered]@{
+            code        = $Changes.Code.Count
+            headers     = $Changes.Header.Count
+            content     = $Changes.Content.Count
+            config      = $Changes.Config.Count
+            shaders     = $Changes.Shader.Count
+            buildConfig = $Changes.BuildConfig.Count
+        }
+        forced        = [bool]$ForceCodePatch
+        warnings      = $warnings
+    }
+    if (-not $DryRun) {
+        [System.IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    # ---- 7. 汇总 ----
+    Write-Host ''
+    if ($ChangedFiles.Count -eq 0) {
+        Write-Host '[代码补丁] 没有检测到运行时二进制变化（可能已经是最新）。' -ForegroundColor Green
+    }
+    else {
+        Write-Host ("[代码补丁] 已镜像 {0} 个文件：" -f $ChangedFiles.Count) -ForegroundColor Green
+        $ChangedFiles | Select-Object -First 10 | ForEach-Object {
+            Write-Host ("  {0}  {1:N0} B" -f $_.path, $_.sizeBytes) -ForegroundColor Gray
+        }
+        if ($ChangedFiles.Count -gt 10) {
+            Write-Host ("  ...（还有 {0} 个）" -f ($ChangedFiles.Count - 10)) -ForegroundColor DarkGray
+        }
+    }
+    if ($DryRun) {
+        Write-Host ('  [DryRun] 不写报告，也不覆盖归档：{0}' -f $reportPath) -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host ("  报告：{0}" -f $reportPath) -ForegroundColor DarkGray
+    }
+    if (-not [string]::IsNullOrWhiteSpace($codePatchLog)) {
+        Write-Host ("  编译日志：{0}" -f $codePatchLog) -ForegroundColor DarkGray
+    }
+    Write-Host '  下一步：重新生成启动器 files[] / fragments；本次没有 cook/pak。' -ForegroundColor Yellow
+    exit 0
+}
 
 # ============================ 清缓存模式 ============================
 if ($ClearCache) {
@@ -538,8 +1134,10 @@ if ($Status) {
     # ① 报告：最近一次打包留下的报告 json
     # 注意目录名用的是平台名（Win64 / Android），不是 Windows / Android 那个
     # —— 见 Build-ChunkReport.ps1 的 $ReportDir
-    # 《快速验证》的报告是单独一份（见 Build-ChunkReport.ps1）
-    $RepSuffix = if ($Mode -eq 'Quick') { '-Quick' } else { '' }
+    # 《快速验证》的报告是单独一份；Development 也单独一份，避免覆盖 Shipping 报告。
+    $RepSuffix = ''
+    if ($Configuration -ne 'Shipping') { $RepSuffix += "-$Configuration" }
+    if ($Mode -eq 'Quick') { $RepSuffix += '-Quick' }
     $ReportPath = Join-Path $ProjectRoot "Saved\PackLogs\ChunkReports\$Platform-$Target$RepSuffix\latest.json"
     $RepTime = ''; $RepMode = ''
     if (Test-Path -LiteralPath $ReportPath) {
@@ -683,7 +1281,7 @@ function Build-UatArgs {
     )
 
     $args = [System.Collections.Generic.List[string]]::new()
-    $AutoClean = $false   # 《版本更新》里缓存体检发现脏了才会变 $true（见 Test-CookCacheDirty）
+    $AutoClean = ($Configuration -ne 'Shipping')   # Development 强制全量 cook，避免和 Shipping 的 cooked 数据混
 
     $args.Add('BuildCookRun')
     $args.Add("-project=$ProjectFile")
@@ -706,24 +1304,24 @@ function Build-UatArgs {
 
     # ---- 客户端 / 服务器 的关键分歧点 ----
     if ($PackTarget -eq 'Server') {
-        $args.Add('-serverconfig=Shipping')
+        $args.Add("-serverconfig=$Configuration")
         $args.Add('-server')
         # 服务器不需要客户端资源以外的很多东西，但 chunk 划分逻辑一致
         # （默认按 clientconfig 算，服务器侧沿用同一套 -manifests 规则）
     }
     else {
-        $args.Add('-clientconfig=Shipping')
+        $args.Add("-clientconfig=$Configuration")
         # 这里**不要**加 -client：工程的 CrossingVoid.Target.cs 声明的是 Game 类型，
         # 而 -client 要求 Client 类型的目标，两者混用 UAT 会直接抛
         # "Cannot mix game and client targets"。
-        # 对 Game 目标来说，-clientconfig=Shipping 就是客户端打包。
+        # 对 Game 目标来说，-clientconfig=$Configuration 就是对应配置的客户端打包。
     }
 
-    # ---- 检查 Shipping 目标是否存在 ----
-    # stage 需要 <工程>\Binaries\Win64\<TargetName>-Win64-Shipping.target
+    # ---- 检查目标是否存在 ----
+    # stage 需要 <工程>\Binaries\Win64\<TargetName>-Win64-<Configuration>.target
     $NeedBuild = $true
     if ($Platform -eq 'Win64') {
-        $ShippingTarget = Join-Path $ProjectRoot "Binaries\Win64\$TargetName-Win64-Shipping.target"
+        $ShippingTarget = Join-Path $ProjectRoot "Binaries\Win64\$TargetName-Win64-$Configuration.target"
         if (Test-Path -LiteralPath $ShippingTarget) { $NeedBuild = $false }
     }
     else {
@@ -941,6 +1539,34 @@ if (-not (Test-Path -LiteralPath $LogDir)) {
 # 实测只传 -map=/Game/MapS/ConnectMap 时，ini 里那 4 张照样被 cook，
 # 结果还是 11247 个包（≈全量）。所以要让"只勾选的地图"真正生效，
 # 只能在打包期间把 ini 里那份清单换成勾选的那几张，打完立刻还原。
+# ============================ 工程版本号（单一来源）============================
+# 面板上的「玩家版本」就是唯一的版本来源，打包时写进两个地方：
+#   · Config\DefaultEngine.ini → AndroidRuntimeSettings.VersionDisplayName（安卓包里显示的版本，后面那段写）
+#   · Config\DefaultGame.ini   → GeneralProjectSettings.ProjectVersion（全平台；游戏运行时一行就能读，
+#                                不用再在代码/蓝图层面手写版本号）
+# **必须写在下面「临时改写 DefaultGame.ini」之前**：地图那一步是"备份→改写→打完还原"，
+# 写在它后面会被还原掉，等于没写。
+if (-not [string]::IsNullOrWhiteSpace($PlayerVersion)) {
+    $GameIniForVersion = Join-Path $ProjectRoot 'Config\DefaultGame.ini'
+    if ($DryRun) {
+        Write-Host "[版本] (DryRun) 本应把 ProjectVersion 写成 $PlayerVersion" -ForegroundColor Yellow
+    }
+    elseif (Test-Path -LiteralPath $GameIniForVersion) {
+        if (Set-IniKey -Path $GameIniForVersion -Section '[/Script/EngineSettings.GeneralProjectSettings]' -Key 'ProjectVersion' -Value $PlayerVersion) {
+            Write-Host "[版本] ProjectVersion = $PlayerVersion（游戏运行时可直接读）" -ForegroundColor Green
+        }
+        else {
+            Write-Host "[版本] ProjectVersion 已经是 $PlayerVersion，不动" -ForegroundColor DarkGray
+        }
+    }
+    else {
+        Write-Host "[版本][警告] 找不到 $GameIniForVersion，ProjectVersion 没写进去" -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host '[版本][警告] 没填「玩家版本」—— 这次产物里没有版本号（游戏读到的是空/默认值）' -ForegroundColor Yellow
+}
+
 $GameIniPath = Join-Path $ProjectRoot 'Config\DefaultGame.ini'
 # 备份一份原件；下面「地图清单」和「服务器散件」两处改写共用这一份，跑完统一还原
 $GameIniBackupPath = Join-Path $ProjectRoot 'Config\DefaultGame.ini.bak-maps-tmp'
@@ -991,7 +1617,7 @@ if (-not $DryRun -and -not [string]::IsNullOrWhiteSpace($Maps)) {
 # 这三项都是 UAT / 引擎直接从工程 ini 读的（ZenUtils.cs:707 读 bUseZenStore；
 # CopyBuildToStagingDirectory.Automation.cs:3018 用 ShouldTreatAsFileServer 决定要不要复制散件），
 # 命令行没有覆盖开关 —— 所以只能临时改写 ini，和上面的地图改写共用同一份备份。
-# 详见 Tools\打包说明.md 的「服务器为什么出散件」一节。
+# 详见 Docs\打包说明.md 的「服务器为什么出散件」一节。
 $bLooseServerPack = $false
 $bAlsoClientRun   = $false
 foreach ($Run in $RunList) {
@@ -1094,7 +1720,12 @@ if ($bLooseServerPack) {
 # ============================ 安卓版本号 ============================
 # 只写 DefaultEngine.ini 里的 AndroidRuntimeSettings.VersionDisplayName（给玩家看的版本）。
 # StoreVersion（versionCode）刻意不动。
-if (-not [string]::IsNullOrWhiteSpace($PlayerVersion)) {
+if ($DryRun -and -not [string]::IsNullOrWhiteSpace($PlayerVersion)) {
+    # DryRun 的语义是"只打印、不动手"。这段以前不看 DryRun，侦察一次就顺手把工程里的版本号
+    # 改了（2026-10-27 干跑踩到：0.1.1 被写成 0.6.1，还得手改回来）。
+    Write-Host "[安卓版本号] (DryRun) 本应把 VersionDisplayName 写成 $PlayerVersion（不改工程文件）" -ForegroundColor Yellow
+}
+elseif (-not [string]::IsNullOrWhiteSpace($PlayerVersion)) {
     $EngineIni = Join-Path $ProjectRoot 'Config\DefaultEngine.ini'
     Assert-Path $EngineIni 'Config\DefaultEngine.ini'
 
@@ -1214,8 +1845,8 @@ foreach ($Run in $RunList) {
     # 所以能编过。这样用户不用关编辑器，打包也不碰 Live Coding。
     if ($Platform -eq 'Win64') {
         $ReceiptName = $TargetName
-        $ReceiptPath = Join-Path $ProjectRoot "Binaries\Win64\$ReceiptName-Win64-Shipping.target"
-        $ShippingExe = Join-Path $ProjectRoot "Binaries\Win64\$ReceiptName-Win64-Shipping.exe"
+        $ReceiptPath = Join-Path $ProjectRoot "Binaries\Win64\$ReceiptName-Win64-$Configuration.target"
+        $TargetExe = Join-Path $ProjectRoot "Binaries\Win64\$ReceiptName-Win64-$Configuration.exe"
 
         # 判定：收据不存在 → 编；收据在但源码比二进制新 → 也编
         $NeedCompile = $false
@@ -1226,15 +1857,15 @@ foreach ($Run in $RunList) {
         }
         else {
             $NewestSrc = Get-NewestProjectSource
-            $BinaryStamp = if (Test-Path -LiteralPath $ShippingExe) {
-                (Get-Item -LiteralPath $ShippingExe).LastWriteTime
+            $BinaryStamp = if (Test-Path -LiteralPath $TargetExe) {
+                (Get-Item -LiteralPath $TargetExe).LastWriteTime
             }
             else {
                 (Get-Item -LiteralPath $ReceiptPath).LastWriteTime
             }
             if ($NewestSrc.Time -and ($NewestSrc.Time -gt $BinaryStamp)) {
                 $NeedCompile = $true
-                $WhyCompile  = ('源码比 Shipping 二进制新：{0}（源码 {1:yyyy-MM-dd HH:mm:ss} / 二进制 {2:yyyy-MM-dd HH:mm:ss}）' -f (Split-Path $NewestSrc.Path -Leaf), $NewestSrc.Time, $BinaryStamp)
+                $WhyCompile  = ('源码比目标二进制新：{0}（源码 {1:yyyy-MM-dd HH:mm:ss} / 二进制 {2:yyyy-MM-dd HH:mm:ss}）' -f (Split-Path $NewestSrc.Path -Leaf), $NewestSrc.Time, $BinaryStamp)
             }
             else {
                 # 时间戳抓不到"插件目录改名/搬家"（改名不动 mtime），而收据里记的是绝对路径 —— 单独查一遍
@@ -1251,14 +1882,14 @@ foreach ($Run in $RunList) {
         }
 
         if ($NeedCompile -and $DryRun) {
-            # DryRun 的语义是"只打印不真干"（见 Tools\打包说明.md），所以这里只报"本应编译"
+            # DryRun 的语义是"只打印不真干"（见 Docs\打包说明.md），所以这里只报"本应编译"
             Write-Host "[编译] (DryRun) 本应编译：$WhyCompile" -ForegroundColor Yellow
         }
         elseif ($NeedCompile) {
             Write-Host ''
-            Write-Host "[编译] $WhyCompile —— 先单独编译 $ReceiptName 的 Shipping 目标（只编这个目标，不会被 Live Coding 挡住）" -ForegroundColor Yellow
+            Write-Host "[编译] $WhyCompile —— 先单独编译 $ReceiptName 的 $Configuration 目标（只编这个目标，不会被 Live Coding 挡住）" -ForegroundColor Yellow
             $BuildBat = Join-Path $EngineRoot 'Engine\Build\BatchFiles\Build.bat'
-            $BuildArgs = @($ReceiptName, 'Win64', 'Shipping', "-Project=$ProjectFile", '-WaitMutex')
+            $BuildArgs = @($ReceiptName, 'Win64', $Configuration, "-Project=$ProjectFile", '-WaitMutex')
             # ---- 从源头不生成 pdb（两个开关必须一起给）----
             # 引擎在 Windows 上是两段式，只看一处会误判：
             #   ① 编译期 UEBuildPlatform.cs:1367
@@ -1274,7 +1905,7 @@ foreach ($Run in $RunList) {
             # 照样产出了 1544.6 MB 的 CrossingVoidServer-Win64-Shipping.pdb。
             # 正确组合：-NoDebugInfo 让 ① 变 false，-NoLinkerDebugInfo 挡住 ② 再打开。
             # 代价：-NoDebugInfo 改了编译参数 → 该目标要全量重编一次（编完中间物也会变小）。
-            # 加 -KeepSymbols 时两个都不给，回到"产出来留档"。详见 Tools\打包说明.md。
+            # 加 -KeepSymbols 时两个都不给，回到"产出来留档"。详见 Docs\打包说明.md。
             if (-not $KeepSymbols) { $BuildArgs += @('-NoDebugInfo', '-NoLinkerDebugInfo') }
             & $BuildBat @BuildArgs
             if ($LASTEXITCODE -ne 0) {
@@ -1290,7 +1921,7 @@ foreach ($Run in $RunList) {
             }
         }
         else {
-            Write-Host ("[编译] {0} Shipping 目标是最新的，跳过编译" -f $ReceiptName) -ForegroundColor DarkGray
+            Write-Host ("[编译] {0} {1} 目标是最新的，跳过编译" -f $ReceiptName, $Configuration) -ForegroundColor DarkGray
         }
     }
     else {
@@ -1390,6 +2021,32 @@ foreach ($Run in $RunList) {
         }
     }
 
+    # ---- 客户端：删掉【另一种配置】留下的运行时二进制 ----
+    # 两种配置共用同一个产物目录（上传脚本认死路径），而 exe / dll / .modules 的文件名里带配置后缀。
+    # 不删的话：打完 Development 再打 Shipping，目录里还留着 *-Win64-Development.exe，
+    # 而上传脚本是整目录枚举（只排除 *.pdb），会把两个 exe 一起传上去。
+    # 只动 Binaries 下带配置后缀的文件：pak / 资源 / 根目录启动 shim 一律不碰。
+    if ($Platform -eq 'Win64' -and $PackTarget -eq 'Client') {
+        $OtherConfig = if ($Configuration -eq 'Development') { 'Shipping' } else { 'Development' }
+        $BinDir = $null
+        $ClientRoot = Join-Path $Run.OutDir $PlatformDir
+        if (Test-Path -LiteralPath $ClientRoot) {
+            $Found = Get-ChildItem -LiteralPath $ClientRoot -Directory -Recurse -Filter 'Binaries' -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($Found) { $BinDir = $Found.FullName }
+        }
+        if ($BinDir) {
+            $StaleFiles = @(Get-ChildItem -LiteralPath $BinDir -Recurse -File -Filter "*-$OtherConfig.*" -ErrorAction SilentlyContinue)
+            if ($DryRun) {
+                Write-Host ("[配置] (DryRun) 本应删掉上一种配置的 {0} 个文件（*-{1}.*）—— {2}" -f $StaleFiles.Count, $OtherConfig, $BinDir) -ForegroundColor Yellow
+            }
+            elseif ($StaleFiles.Count -gt 0) {
+                foreach ($StaleFile in $StaleFiles) { Remove-Item -LiteralPath $StaleFile.FullName -Force -ErrorAction SilentlyContinue }
+                Write-Host ("[配置] 已删掉上一种配置的 {0} 个文件（*-{1}.*）—— 两种配置共用产物目录，不删会混包" -f $StaleFiles.Count, $OtherConfig) -ForegroundColor Yellow
+            }
+        }
+    }
+
     $built    = Build-UatArgs -PackTarget $PackTarget -OutDir $OutDir -TargetName $TargetName
     $uatArgs  = $built.Args
     $ArgString = ($uatArgs | ForEach-Object { "`"$_`"" }) -join ' '
@@ -1450,8 +2107,9 @@ foreach ($Run in $RunList) {
 
     # ============================ 产物盘点 ============================
     if ($ExitCode -eq 0) {
-        # 归档目录名 = target 名（客户端 <工程名>，服务器 <工程名>Server）
-        $SubName = $TargetName
+        # 归档目录名 = 工程名（UAT 的 ShortProjectName），不是 target 名；
+        # 服务器那一侧是 WindowsServer\FantasyProject\...，exe 才叫 FantasyProjectServer-...
+        $SubName = $ProjectName
         $PaksDir = Join-Path $OutDir "$PlatformDir\$SubName\Content\Paks"
 
         # ---- 《快速验证》留个显眼的标记 ----
@@ -1499,6 +2157,45 @@ foreach ($Run in $RunList) {
         else {
             Write-Host '  （-KeepSymbols：保留 pdb，也不加 -NoLinkerDebugInfo）' -ForegroundColor DarkGray
         }
+
+        # ---- 版本戳：这批产物是哪个版本、什么时候打的 ----
+        # 2026-10-26 那次事故的根因是"碎片生成拿着 10/11 的旧包当新包"（源目录里的 APK/OBB 都停在
+        # 10-11 23:22，版本还是 0.6.0）。这里在归档根写一份 Version.json：下游（碎片生成 / 发布）
+        # 先读它、比对版本和时间，拿错目录就能当场停下，而不是把旧包当新号发出去。
+        # 放在归档根、不进 Windows/Android 子目录 —— 否则会被启动器的整目录枚举一起发布。
+        $ArtifactDir = if ($PackTarget -eq 'Server') { 'WindowsServer' } else { $PlatformDir }
+        $ArtifactPath = Join-Path $OutDir $ArtifactDir
+        $StampFiles = @()
+        if (Test-Path -LiteralPath $ArtifactPath) {
+            $StampFiles = @(Get-ChildItem -LiteralPath $ArtifactPath -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in '.apk', '.obb', '.exe' } |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        path     = $_.FullName.Substring($OutDir.Length).TrimStart('\')
+                        size     = $_.Length
+                        modified = $_.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss')
+                    }
+                })
+        }
+        $Stamp = [ordered]@{
+            version        = $PlayerVersion
+            versionSource  = 'CrossingChunkEditor 面板「玩家版本」→ GeneralProjectSettings.ProjectVersion'
+            mode           = $Mode
+            platform       = $Platform
+            target         = $PackTarget
+            configuration  = $Configuration
+            releaseVersion = $ReleaseVersion
+            project        = $ProjectName
+            packedAt       = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+            archiveDir     = $OutDir
+            artifactDir    = $ArtifactDir
+            files          = $StampFiles
+        }
+        $StampPath = Join-Path $OutDir 'Version.json'
+        [System.IO.File]::WriteAllText($StampPath, (($Stamp | ConvertTo-Json -Depth 4) + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host ''
+        Write-Host ("[版本戳] {0} · {1} · {2} · {3} 个产物文件" -f $(if ($PlayerVersion) { $PlayerVersion } else { '(未填版本)' }), $Mode, $ArtifactDir, $StampFiles.Count) -ForegroundColor Green
+        Write-Host "         $StampPath" -ForegroundColor DarkGray
 
         # ---- PC 客户端：自检运行库安装器有没有被 stage 进来 ----
         # 这两份不是我们手工拷的，靠官方开关：
@@ -1680,7 +2377,7 @@ foreach ($Run in $RunList) {
             if (Test-Path -LiteralPath $ReportScript) {
                 try {
                     & $ReportScript -ProjectRoot $ProjectRoot -ArchiveDir $OutDir `
-                        -Platform $Platform -Target $PackTarget -TargetName $TargetName -Mode $Mode -PackLogPath $LogFile
+                        -Platform $Platform -Target $PackTarget -Mode $Mode -Configuration $Configuration -PackLogPath $LogFile
                 }
                 catch {
                     Write-Host "  [警告] 分包报告生成失败：$($_.Exception.Message)" -ForegroundColor Yellow

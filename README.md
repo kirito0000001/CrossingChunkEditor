@@ -77,14 +77,19 @@ pakchunk0-Windows.utoc / .ucas ...
 
 **左栏**
 
-- 标题行：`共 N 个分块、M 个目录标记   规则文件：<路径>`
-- 刷新 / 目标下拉 / 模式下拉 / 开始打包 / 复制命令 / 撤销解散 / 日志目录 / 清除缓存
-- 输出目录（`-ArchiveDir`）、地图摘要、玩家版本、基线版本（只读）、基线目录
+- 标题行：`共 N 个分块、M 个目录标记   规则文件：<路径>` +「刷新」「撤销解散」（这两个是规则操作）
+- 打包：目标下拉 / 模式下拉 /「开始打包」/「代码补丁」（安卓下自动隐藏）
+- 输出目录（`-ArchiveDir`）、地图摘要
+- 版本行：玩家版本、基线版本（只读）、基线目录 —— **服务器下整行隐藏**；
+  不建基线的《快速验证》下只留玩家版本
 - 状态行：`报告：` / `产物：` / `基线：`
 - 选择地图（扫 `AssetRegistry` 里的 `World` 资产，带搜索框 + 重新扫描 + 全部不勾）
 - 规则列表：`号 | 名字（双击可改） | 分类（可编辑） | 目录数 | 文件数 | 体积 | 变化 | 解散`，
   有分类时按「分类 → ChunkId」分组显示（组间插只读标题行，未分组垫底）
-- 「运行设置（额外）」折叠区：Cook 进程数、基线位置
+- 「运行设置（额外）」折叠区 —— 和打包参数无关的都在这里：
+  Cook 进程数、开发模式打包（仅 Windows；服务器固定 Development 所以不显示，见 5.2）、
+  基线位置（只读；服务器 / 《快速验证》下隐藏）、
+  工具（复制命令 / 日志目录 / 清除缓存 / 产物目录 / 版本自检）
 
 **右栏**
 
@@ -179,14 +184,152 @@ pakchunk0-Windows.utoc / .ucas ...
   Windows 解析命令行时裸引号会被吃掉：逗号被当成数组分隔符 → `-Maps` 绑不定 `[string]`
   （实测报 `ParameterArgumentTransformationError`）；带空格的路径会被拆成两个参数。
 
+### 5.1 代码补丁（仅编译）
+
+只改 C++ 逻辑、没改资产/反射布局/Shader/Config 时，用工具栏的 **「代码补丁」** 按钮
+（或命令行 `-CodeOnly`）：
+
+- 只 build 当前目标的 Shipping，**不 cook / stage / pak / 不改 chunk 规则**；
+- 对比构建输出与归档里的 `Binaries`，只覆盖变化的 `.exe / .dll / .modules / .version`；
+- 变化扫描以最后一次完整打包报告为基准：Content / Config / Shader / 构建配置变化会拦下
+  （脚本 `exit 2`），面板会弹一次「强制继续」；头文件变化只警告；
+- 报告写到 `Saved\PackLogs\CodePatch\last-code-patch.json`；
+- 当前 monolithic 时覆盖 Shipping exe；将来切 modular Shipping 后自动只覆盖游戏模块 DLL
+  + `.modules` / `.version`，引擎 DLL 不变（同一套代码，不用改）；
+- **Android 不支持**：代码在 APK 的 `.so` 里，需要重打 APK；
+- 发布脚本仍要重算启动器 `files[]` / fragments —— 插件只负责把归档里的二进制换掉。
+
+命令行等价：
+
+```powershell
+# 只编译 + 覆盖归档；先看会发生什么就加 -DryRun
+.\Pack-CrossingVoid.ps1 -CodeOnly -Target Client -ProjectRoot "C:\YourProject" -ArchiveDir "F:\YourArchive"
+# 变化扫描拦下后强制继续（危险，只在确认不需要 cook 时用）
+.\Pack-CrossingVoid.ps1 -CodeOnly -ForceCodePatch -Target Client -ProjectRoot "C:\YourProject" -ArchiveDir "F:\YourArchive"
+```
+
+> 设计细节（BuildId 回收、modular 布局、原型验证）见
+> `Docs/2026-10-20-纯代码补丁模式设计.md`。
+
+### 5.2 打包配置：正式包 / 开发模式（Development）
+
+「运行设置（额外）」里那个勾选框决定传给脚本的 `-Configuration`：
+
+| 配置 | 产物目录 | 基线 | 屏幕打印 |
+|---|---|---|---|
+| 正式包（Shipping） | `<输出目录>\Windows` | `<输出目录>\Release` | **看不到** |
+| 开发模式（Development） | `<输出目录>\Windows`（**同一条路径**） | `<输出目录>\Release-Development` | 可见 |
+
+**产物目录故意不按配置分**：发布/上传脚本（AxTools 的 `-GamePackageRoot`，例如
+`F:\DaBaoV\Fantasy\Windows`）认死了这条路径，产物一挪它就会拿旧包去传 —— 不报错，更难发现。
+**基线则必须分开**：两种配置共用 `<输出目录>\Release\<版本>\<平台>` 的话，Development 的
+《版本更新》（UAT 会先删了重建）会把正式基线整个覆盖掉，之后正式线算补丁就拿开发版当基准了。
+另外脚本在客户端打包时会把**另一种配置的 `exe`/`dll`**（文件名带配置后缀）从归档里删掉，
+避免目录里同时躺着两个 exe 被一起上传（上传脚本是整目录枚举，只排除 `*.pdb`）。
+
+**默认值按目标走**（每个目标各自记住你勾没勾，`DevelopmentBuild_Client`）：
+
+| 目标 | 配置 | 说明 |
+|---|---|---|
+| 服务器 | **Development（固定）** | 界面上不显示这个开关：房间的启动/回收全靠 `UE_LOG`，而 Shipping 会把 `UE_LOG` 和控制台整段编掉 |
+| Windows 客户端 | Shipping（默认，可改） | 玩家不需要，也不该给玩家一个能敲命令的入口 |
+| 安卓 | Shipping（固定） | 脚本直接拦（`Development` 只支持 Win64） |
+
+服务器走 Development 有个副作用：**「代码补丁」只编译 Shipping，所以它永远不可用于服务器**
+（按钮灰着，悬停会说清原因）。服务器改 C++ 就重打一次包、再 git 提交；
+确实要发 Shipping 服务器时用命令行 `-Configuration Shipping`。
+
+**为什么正式包看不到 `PrintString`：** 不是开关没开，是那段代码根本没编进去 ——
+引擎 `UnrealEngine.cpp:12468` 的 `UEngine::AddOnScreenDebugMessage` 整个函数体包在
+`#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)` 里，蓝图 `PrintString`
+（`KismetSystemLibrary.cpp:534`）调的正是它。所以只有 Development / Debug 看得见，
+Shipping 重打多少遍都一样。同一个道理，服务器 Shipping 里的 `UE_LOG`（开房间、回收那些日志）
+也会整段消失，只剩退出码。
+
+**Development 也能走《常规补丁》**，前提是**整条线都待在 Development 里**。
+基线按配置分开（`Release` / `Release-Development`），所以
+Development 里《版本更新》建基线 → Development 里《常规补丁》打补丁，和正式线互不污染；
+产物目录共用一条，不用为上传脚本改来改去。五条边界：
+
+- **补丁只带资源**（pak / IoStore chunk）。改 C++ 不在补丁里 —— Development 线就是重打一次包、
+  把新的 exe 一起发出去；「代码补丁」按钮只做 Shipping，开发模式下是灰的。
+- **两种配置的产物挤在同一个目录里**，所以**同一时刻只留一种**：脚本会在客户端打包前删掉
+  另一种配置的 `exe`/`dll`（`*-Shipping.*` / `*-Development.*`），pak 和资源则由后打的那次覆盖。
+  这也意味着**打完一种配置就立刻上传**，别在中间混着打另一种。
+- **客户端 Development 每次全量 cook**：脚本对非 Shipping 强制 `AutoClean`（`-clean`），因为
+  Development 和 Shipping 共用 `Saved\Cooked`，混着用会串味。代价是比正式包慢。
+  服务器不受这条影响（它本来每轮就全量 cook：脚本会先删 `Saved\Cooked\WindowsServer`）。
+- **两条线共用同一份 chunk 规则**（`Config\DefaultCrossingChunk.ini`）：在 Development 线里
+  跑《常规补丁》攒出来的「版本补丁N」，到正式线《版本更新》时一样要划分掉。
+- **安卓没有 Development**（脚本直接拦）：安卓测试包用 Shipping；勾选框在安卓目标下是灰的，
+  切过去会自动关掉。
+
+### 5.3 版本号：一处填写，游戏直接读
+
+**「玩家版本」是唯一的版本来源。** 打包时脚本把它写进两个地方，都在包内、运行时都读得到：
+
+| 写进哪 | 谁在用 |
+|---|---|
+| `Config\DefaultGame.ini` → `[/Script/EngineSettings.GeneralProjectSettings] ProjectVersion` | 游戏运行时读（全平台） |
+| `Config\DefaultEngine.ini` → `AndroidRuntimeSettings.VersionDisplayName` | 安卓包 / 商店显示的版本（`StoreVersion` 刻意不动） |
+
+游戏侧读法（已经加在游戏模块里，蓝图有节点 **幻杀 → 获取工程版本号**）：
+
+```cpp
+FString UBaseBPLibrary::GetProjectVersion()
+{
+    FString Version;
+    GConfig->GetString(TEXT("/Script/EngineSettings.GeneralProjectSettings"), TEXT("ProjectVersion"), Version, GGameIni);
+    return Version;
+}
+```
+
+> 引擎自带节点里**没有**「项目版本」：`GetBuildVersion` 返回的是引擎构建号、`GetEngineVersion` 是引擎版本，
+> 而 `UGeneralProjectSettings::ProjectVersion` 只对 C++ 可见（`config, EditAnywhere`，没有 BlueprintReadOnly）。
+> 所以要包一层蓝图库 —— 这也正是"以后别再手写版本号"的关键一步。
+
+**打包成功后**，脚本会在归档根写一份 `Version.json`（版本 / 模式 / 平台 / 配置 / 时间 / 大件清单）：
+
+```json
+{ "version": "0.6.1", "mode": "Base", "platform": "Android", "configuration": "Shipping",
+  "packedAt": "2026-10-27T12:34:56+08:00", "artifactDir": "Android",
+  "files": [ { "path": "Android/xxx.apk", "size": 75984616, "modified": "2026-10-27T12:33:01" } ] }
+```
+
+它放在归档根、**不在** `Windows` / `Android` 子目录里 —— 否则会被启动器的整目录枚举一起发布出去。
+
+### 5.4 旧包自检（防「旧包拿新号」）
+
+生成碎片 / 上传之前，点「运行设置（额外）→ 工具 → **版本自检**」。命令行等价：
+
+```powershell
+.\Test-PackageVersion.ps1 -ArchiveDir "F:\DaBaoV\Fantasy" -ExpectedVersion 0.6.1 -Platform Android
+```
+
+它拦四种情况，任一命中就 `exit 1` 并说明原因：
+
+| 情况 | 拦下的理由 |
+|---|---|
+| 目录里没有 `Version.json` | 不是插件打的包 —— 典型的"目录指错了" |
+| `version` ≠ 期望版本 | 版本号不一致，就是「旧包拿新号」 |
+| `packedAt` 超过 24 小时 | 版本戳太旧，多半是上一次打包留下的 |
+| `mode` = `Quick` | 快速验证的产物不打 pak，不能发布 |
+
+> 2026-10-26 那次（碎片源目录 `H:\DaBaoV\Crossingvoid\Android` 里是 10-11 的包、版本却是 0.6.0）
+> 命中的就是前两条 —— 现在会在发布前当场拦下，而不是"发出去几天后才发现玩家下的是旧包"。
+>
+> 注意：这道闸只有在**被调用**时才起作用。碎片生成走的是 AxTools 的流程，要么在那边调一次
+> `Test-PackageVersion.ps1`（参数照上面），要么养成"发布前先点一下版本自检"的习惯。
+
 ### 6. 两条前置检查（把「跑到一半才失败」提前到点击那一刻）
 
-1. **目标 Shipping 二进制不存在（或已过期）**
-   脚本会先看三件事：收据不存在、源码比 Shipping 二进制新、收据里记的插件路径已失效。
+1. **目标二进制不存在（或已过期）**
+   脚本会先看三件事：收据不存在、源码比该配置的二进制新、收据里记的插件路径已失效。
    命中任意一条就先**单独编译那个目标**，再让 UAT 带 `-nocompile` 跑 ——
    不把编译交给 UAT 的 `-build`，因为那一轮会顺带编编辑器目标，撞上 Live Coding 的互斥体。
    → 面板不硬闯、也不 return：把提示写进日志，具体编译交给脚本
    （单独编译只针对这个目标，不会被 Live Coding 挡住，所以编辑器不用关）。
+   收据名带配置后缀（`<目标>-Win64-<配置>.target`），面板的前置提示也按当前配置去找。
 
 2. **《常规补丁》但找不到基线**
    → 弹窗问「要先切到《版本更新》跑一次吗？」，点是就自动切好（并在状态栏说明「再点一次开始打包」）。
@@ -305,11 +448,13 @@ CrossingChunkEditor/
 │     ├─ CrossingChunkEditorModule.cpp   规则读写 + 两个菜单入口
 │     └─ SCrossingChunkPanel.cpp         Slate UI + 打包调度 + 报告/状态解析
 ├─ Tools/                                ← 打包脚本（跟着插件走，见下一节）
-│  ├─ Pack-CrossingVoid.ps1              打包 / 清缓存 / 状态查询：主入口
+│  ├─ Pack-CrossingVoid.ps1              打包 / 清缓存 / 状态查询 / 代码补丁：主入口
 │  ├─ Build-PakFileRules.ps1             DefaultCrossingChunk.ini → DefaultPakFileRules.ini
-│  ├─ Build-ChunkReport.ps1              产出分包报告 json
-│  └─ 打包说明.md                          脚本侧的完整说明
+│  └─ Build-ChunkReport.ps1              产出分包报告 json
 └─ Docs/
+   ├─ 打包说明.md                         脚本侧的完整说明（参数 / 产物 / 服务器散件 / pdb）
+   ├─ 2026-10-20-纯代码补丁模式设计.md    代码补丁架构：模块化 + BuildId 回收 + 二进制镜像
+   └─ 2026-09-20-待办-安卓分包报告.md     安卓分包报告的历史排查记录
 ```
 
 模块类型 `Editor` / `LoadingPhase` `PostEngineInit`。
@@ -377,7 +522,7 @@ Saved\PackLogs\ChunkReports\<Win64-Client|Android-Client>[-Quick]\latest.json
 | 值 | 位置 | 说明 |
 |---|---|---|
 | `D:\UnrealEngine-5.8.2` | 三份脚本的 `-EngineRoot` / `-UatLogDir` | 引擎根目录。源码版才需要；Launcher 版改成对应安装路径 |
-| `F:\DaBaoV\Crossingvoid` | `Pack-CrossingVoid.ps1` 的 `-ArchiveDir` / `-ReleaseRoot` | 默认输出目录与基线目录（面板上的「输出目录」「基线位置」会覆盖它） |
+| `F:\DaBaoV\Crossingvoid` | `Pack-CrossingVoid.ps1` 的 `-ArchiveDir` | 默认输出目录（面板上的「输出目录」会覆盖它）；基线位置自动 = `<输出目录>\Release`，**不用再单独改** |
 
 工程名 / target 名**不用改**：从 `*.uproject` 和 `Source\*.Target.cs` 自动推导。
 
@@ -479,6 +624,8 @@ MD5 前 16 位（约 1.1 万个文件 / 4.6 GB，实测 20–25 秒；源文件�
   （`PrimaryAssetLabel` 为什么失效、`-RunChunkAssigner`、`bUseZenStore` 必须配 `bUseIoStore`、
   ZenServer 生命周期、`DefaultPakFileRules.ini` 的匹配顺序与收尾三条）。
   <https://zhuanlan.zhihu.com/p/2084724901970289419>
-- `Tools\打包说明.md`——脚本侧的打包说明（参数、产物、服务器散件、pdb 与符号文件等）。
+- `Docs\打包说明.md`——脚本侧的打包说明（参数、产物、服务器散件、pdb 与符号文件等）。
+- `Docs\2026-10-20-纯代码补丁模式设计.md`——代码补丁（`-CodeOnly`）的长期架构：
+  模块化 Shipping + BuildId 回收 + 运行时二进制镜像、原型验证与回退方案。
 - 参考：`UE5 非uasset资产Chunk/Pak 划分踩坑笔记` <https://zhuanlan.zhihu.com/p/689375430>
 - 参考：`Engine\Config\BasePakFileRules.ini`（引擎自带，PakFileRules 全部字段的权威说明）

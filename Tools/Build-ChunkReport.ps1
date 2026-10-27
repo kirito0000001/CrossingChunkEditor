@@ -25,10 +25,8 @@ param(
     [string]$ArchiveDir  = 'F:\DaBaoV\Crossingvoid',
     [ValidateSet('Win64', 'Android')][string]$Platform = 'Win64',
     [ValidateSet('Client', 'Server')][string]$Target = 'Client',
-    # 归档目录 / Paks 目录用的 target 名；留空 = <工程名>（服务器加 Server 后缀）。
-    # Pack-CrossingVoid.ps1 会把从 Source\*.Target.cs 推出来的名字显式传进来。
-    [string]$TargetName = '',
     [ValidateSet('Quick', 'Base', 'Patch')][string]$Mode = 'Quick',
+    [ValidateSet('Shipping', 'Development')][string]$Configuration = 'Shipping',
     [string]$PackLogPath = '',
     [string]$UatLogDir = 'D:\UnrealEngine-5.8.2\Engine\Programs\AutomationTool\Saved\Logs',
     [string]$EngineRoot = 'D:\UnrealEngine-5.8.2',
@@ -72,10 +70,8 @@ $ProjectFile = $ProjectCandidates |
 if (-not $ProjectFile) { $ProjectFile = $ProjectCandidates | Select-Object -First 1 }
 $ProjectName = if ($ProjectFile) { $ProjectFile.BaseName } else { Split-Path -Leaf $ProjectRoot }
 
-# 归档目录名：脚本显式传了就用；没传按 target 类型推（客户端 = 工程名，服务器 = 工程名 + Server）。
+# 归档目录名 = 工程名（UAT 的 ShortProjectName）；服务器也是 <工程名>，不是 <工程名>Server。
 $SubName = $ProjectName
-if ($Target -eq 'Server') { $SubName = "$($ProjectName)Server" }
-if (-not [string]::IsNullOrWhiteSpace($TargetName)) { $SubName = $TargetName }
 
 $RuleFile     = Join-Path $ProjectRoot 'Config\DefaultPakFileRules.ini'
 
@@ -95,7 +91,10 @@ $PaksDir      = Join-Path $ArchiveDir "$PlatformDir\$SubName\Content\Paks"
 $AllChunksCsv = Join-Path $ProjectRoot "Saved\Cooked\$PlatformDir\$ProjectName\Metadata\AllChunksInfo.csv"
 # 《快速验证》单独放一份报告：它不打 pak，体积那几列必然是 0，
 # 混在一起会把正式报告（版本更新 / 常规补丁的体积、变化）冲掉。
-$ReportSuffix = if ($Mode -eq 'Quick') { '-Quick' } else { '' }
+# 《快速验证》/ Development 各单独放一份报告，避免互相覆盖。
+$ReportSuffix = ''
+if ($Configuration -ne 'Shipping') { $ReportSuffix += "-$Configuration" }
+if ($Mode -eq 'Quick') { $ReportSuffix += '-Quick' }
 $ReportDir    = Join-Path $ProjectRoot "Saved\PackLogs\ChunkReports\$Platform-$Target$ReportSuffix"
 $LatestPath   = Join-Path $ReportDir 'latest.json'
 
@@ -503,9 +502,10 @@ $SettingsSnapshot['AndroidIconDefaultCount'] = $IconDefault
 
 $Report = [ordered]@{
     schemaVersion  = 1
-    reportId       = "$Stamp-$Mode"
+    reportId       = "$Stamp-$Mode-$Configuration"
     generatedAt    = (Get-Date -Format 'yyyy-MM-ddTHH:mm:sszzz')
     mode           = $Mode
+    configuration  = $Configuration
     platform       = $Platform
     target         = $Target
     project        = $ProjectName
